@@ -1,0 +1,11 @@
+name: rocketchat-platform
+kind: platform
+version: 0.1.0
+description: >
+  Rocket.Chat gateway adapter for Hermes Agent. Connects via Rocket.Chat REST API
+  and Realtime DDP WebSocket to relay room and DM messages to Hermes.
+author: Mark Mayer + Hermes Agent
+requires_env:
+  - ROCKETCHAT_URL
+  - ROCKETCHAT_USER_ID
+  - ROCKETCHAT_AUTH_TOKEN

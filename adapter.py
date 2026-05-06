@@ -1,0 +1,625 @@
+"""
+Rocket.Chat Platform Adapter for Hermes Agent.
+
+Hermes-native gateway plugin inspired by Jake Miller's MIT-licensed
+rocketchat-openclaw transport, but implemented directly against Hermes'
+BasePlatformAdapter interface.
+
+Configuration in ~/.hermes/config.yaml::
+
+    gateway:
+      platforms:
+        rocketchat:
+          enabled: true
+          token: "<bot auth token>"        # optional; env can be used instead
+          extra:
+            url: "https://chat.example.com"
+            user_id: "<bot user id>"
+            reply_mode: "thread"           # off | thread | auto
+            auto_thread_chars: 280
+            require_mention: false
+            ack_reaction: "eyes"           # false/empty disables
+            mark_as_read: true
+            rooms:                         # optional per-room overrides
+              ROOM_ID:
+                require_mention: true
+                reply_mode: "thread"
+
+Environment variables override/seed config:
+    ROCKETCHAT_URL
+    ROCKETCHAT_USER_ID
+    ROCKETCHAT_AUTH_TOKEN
+    ROCKETCHAT_ALLOWED_USERS
+    ROCKETCHAT_ALLOW_ALL_USERS
+    ROCKETCHAT_HOME_CHANNEL
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urljoin, urlsplit
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.helpers import MessageDeduplicator
+
+logger = logging.getLogger(__name__)
+
+MAX_MESSAGE_LENGTH = 12000
+_RECONNECT_BASE_DELAY = 2.0
+_RECONNECT_MAX_DELAY = 60.0
+_RECONNECT_JITTER = 0.2
+_STALE_MESSAGE_AGE_SEC = 5 * 60
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_url(url: str) -> str:
+    raw = str(url or "").strip().rstrip("/")
+    if raw and not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    return raw
+
+
+def _websocket_url(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{scheme}://{parsed.netloc}/websocket"
+
+
+def _date_to_epoch(value: Any) -> Optional[float]:
+    """Parse Rocket.Chat/Meteor timestamps into seconds since epoch."""
+    if value is None:
+        return None
+    if isinstance(value, dict) and "$date" in value:
+        try:
+            raw = float(value["$date"])
+            return raw / 1000 if raw > 10_000_000_000 else raw
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+        return raw / 1000 if raw > 10_000_000_000 else raw
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            raw = float(text)
+            return raw / 1000 if raw > 10_000_000_000 else raw
+        try:
+            # Rocket.Chat examples use ISO strings with Z.
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _room_type(rc_type: str | None) -> str:
+    if rc_type == "d":
+        return "dm"
+    if rc_type in {"p", "g"}:
+        return "group"
+    return "channel"
+
+
+def _strip_bot_mention(text: str, bot_username: str) -> str:
+    if not text or not bot_username:
+        return text or ""
+    pattern = re.compile(rf"(^|\s)@{re.escape(bot_username)}\b[:,]?\s*", re.IGNORECASE)
+    return pattern.sub(" ", text).strip()
+
+
+@dataclass
+class _RoomInfo:
+    rid: str
+    name: str = ""
+    fname: str = ""
+    t: str = "c"
+
+    @property
+    def display_name(self) -> str:
+        return self.fname or self.name or self.rid
+
+    @property
+    def chat_type(self) -> str:
+        return _room_type(self.t)
+
+
+class _DDPClient:
+    """Small Rocket.Chat DDP client using the already-installed websockets package."""
+
+    def __init__(self, adapter: "RocketChatAdapter") -> None:
+        self.adapter = adapter
+        self.ws: Any = None
+        self._next_id = 0
+        self._pending: dict[str, asyncio.Future] = {}
+        self._desired_rooms: set[str] = set()
+        self._active_rooms: set[str] = set()
+        self._connected = asyncio.Event()
+        self._login_id: Optional[str] = None
+        self._closing = False
+
+    def next_id(self) -> str:
+        self._next_id += 1
+        return str(self._next_id)
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        if self.ws is None:
+            raise RuntimeError("Rocket.Chat DDP websocket is not connected")
+        await self.ws.send(json.dumps(payload, separators=(",", ":")))
+
+    async def connect_once(self) -> None:
+        import websockets
+
+        self._closing = False
+        self._connected.clear()
+        self._active_rooms.clear()
+        url = _websocket_url(self.adapter.base_url)
+        logger.info("Rocket.Chat: connecting realtime websocket to %s", url)
+        async with websockets.connect(url, ping_interval=None, close_timeout=10) as ws:
+            self.ws = ws
+            await self.send_json({"msg": "connect", "version": "1", "support": ["1"]})
+            async for raw in ws:
+                await self._handle_raw(raw)
+        self.ws = None
+
+    async def _handle_raw(self, raw: str | bytes) -> None:
+        try:
+            msg = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            logger.debug("Rocket.Chat: ignored unparsable DDP frame")
+            return
+
+        kind = msg.get("msg")
+        if kind == "ping":
+            await self.send_json({"msg": "pong"})
+            return
+        if kind == "connected":
+            # Rocket.Chat requires a DDP login before subscriptions. Do not
+            # await a method result from inside the frame handler; the same
+            # receive loop must remain free to process the later result frame.
+            self._login_id = self.next_id()
+            await self.send_json({
+                "msg": "method",
+                "method": "login",
+                "id": self._login_id,
+                "params": [{"resume": self.adapter.auth_token}],
+            })
+            return
+        if kind == "result":
+            msg_id = str(msg.get("id"))
+            if self._login_id and msg_id == self._login_id:
+                self._login_id = None
+                if msg.get("error"):
+                    raise RuntimeError(f"DDP login failed: {msg.get('error')}")
+                self._connected.set()
+                await self.resubscribe_all()
+                return
+            fut = self._pending.pop(msg_id, None)
+            if fut and not fut.done():
+                if msg.get("error"):
+                    fut.set_exception(RuntimeError(str(msg.get("error"))))
+                else:
+                    fut.set_result(msg.get("result"))
+            return
+        if kind == "changed" and msg.get("collection") == "stream-room-messages":
+            fields = msg.get("fields") or {}
+            for incoming in fields.get("args") or []:
+                await self.adapter._handle_rc_message(incoming)
+            return
+        if kind == "nosub":
+            logger.warning("Rocket.Chat: DDP subscription failed: %s", msg)
+
+    async def call(self, method: str, params: list[Any] | None = None, timeout: int = 30) -> Any:
+        msg_id = self.next_id()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending[msg_id] = fut
+        await self.send_json({"msg": "method", "method": method, "id": msg_id, "params": params or []})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(msg_id, None)
+
+    async def subscribe_room(self, rid: str) -> None:
+        rid = str(rid or "").strip()
+        if not rid:
+            return
+        self._desired_rooms.add(rid)
+        if self.ws is None or not self._connected.is_set() or rid in self._active_rooms:
+            return
+        sub_id = self.next_id()
+        self._active_rooms.add(rid)
+        await self.send_json({
+            "msg": "sub",
+            "id": sub_id,
+            "name": "stream-room-messages",
+            "params": [rid, {"useCollection": False, "args": [{"lastUpdate": {"$date": int(time.time() * 1000)}}]}],
+        })
+
+    async def resubscribe_all(self) -> None:
+        for rid in list(self._desired_rooms):
+            await self.subscribe_room(rid)
+
+    async def close(self) -> None:
+        self._closing = True
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
+        if self.ws is not None:
+            await self.ws.close()
+
+
+class RocketChatAdapter(BasePlatformAdapter):
+    """Rocket.Chat gateway adapter using REST API v1 + Realtime DDP."""
+
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
+    def __init__(self, config: PlatformConfig):
+        platform = Platform("rocketchat")
+        super().__init__(config=config, platform=platform)
+        extra = getattr(config, "extra", {}) or {}
+
+        self.base_url = _normalize_url(extra.get("url") or extra.get("base_url") or os.getenv("ROCKETCHAT_URL", ""))
+        self.user_id = str(extra.get("user_id") or os.getenv("ROCKETCHAT_USER_ID", "")).strip()
+        self.auth_token = str(getattr(config, "token", None) or extra.get("auth_token") or os.getenv("ROCKETCHAT_AUTH_TOKEN", "")).strip()
+        self.reply_mode = str(extra.get("reply_mode") or os.getenv("ROCKETCHAT_REPLY_MODE", "thread")).lower()
+        self.auto_thread_chars = int(extra.get("auto_thread_chars") or os.getenv("ROCKETCHAT_AUTO_THREAD_CHARS", "280"))
+        self.require_mention = bool(extra.get("require_mention", _truthy(os.getenv("ROCKETCHAT_REQUIRE_MENTION", "false"))))
+        self.ack_reaction = extra.get("ack_reaction", os.getenv("ROCKETCHAT_ACK_REACTION", ""))
+        self.mark_as_read = bool(extra.get("mark_as_read", _truthy(os.getenv("ROCKETCHAT_MARK_AS_READ", "false"))))
+        self.rooms_config: dict[str, Any] = extra.get("rooms", {}) if isinstance(extra.get("rooms"), dict) else {}
+
+        self._session: Any = None
+        self._ddp = _DDPClient(self)
+        self._ws_task: Optional[asyncio.Task] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._closing = False
+        self._bot_username = ""
+        self._bot_name = ""
+        self._rooms: dict[str, _RoomInfo] = {}
+        self._dedup = MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
+
+    @property
+    def name(self) -> str:
+        return "Rocket.Chat"
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "X-Auth-Token": self.auth_token,
+            "X-User-Id": self.user_id,
+            "Content-Type": "application/json",
+        }
+
+    async def _api_get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        import aiohttp
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        for attempt in range(4):
+            async with self._session.get(url, headers=self._headers(), params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                body_text = await resp.text()
+                if resp.status in {429, 502, 503, 504} and attempt < 3:
+                    await asyncio.sleep(self._retry_delay(resp, attempt))
+                    continue
+                if resp.status >= 400:
+                    raise RuntimeError(f"GET {path} failed HTTP {resp.status}: {body_text[:300]}")
+                return json.loads(body_text or "{}")
+        return {}
+
+    async def _api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import aiohttp
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        for attempt in range(4):
+            async with self._session.post(url, headers=self._headers(), json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                body_text = await resp.text()
+                if resp.status in {429, 502, 503, 504} and attempt < 3:
+                    await asyncio.sleep(self._retry_delay(resp, attempt))
+                    continue
+                if resp.status >= 400:
+                    raise RuntimeError(f"POST {path} failed HTTP {resp.status}: {body_text[:300]}")
+                return json.loads(body_text or "{}")
+        return {}
+
+    @staticmethod
+    def _retry_delay(resp: Any, attempt: int) -> float:
+        try:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                return min(float(retry_after), 30.0)
+        except Exception:
+            pass
+        return min((2 ** attempt) + random.uniform(0, 0.5), 30.0)
+
+    async def connect(self) -> bool:
+        import aiohttp
+
+        if not self.base_url or not self.user_id or not self.auth_token:
+            logger.error("Rocket.Chat: ROCKETCHAT_URL, ROCKETCHAT_USER_ID, and ROCKETCHAT_AUTH_TOKEN are required")
+            self._set_fatal_error("config_missing", "Rocket.Chat URL, user ID, or auth token missing", retryable=False)
+            return False
+
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        self._closing = False
+        try:
+            me = await self._api_get("/api/v1/me")
+            user = me.get("_id") and me or me.get("user", {})
+            self._bot_username = str(user.get("username") or "")
+            self._bot_name = str(user.get("name") or self._bot_username or self.user_id)
+            logger.info("Rocket.Chat: authenticated as @%s (%s) on %s", self._bot_username, self.user_id, self.base_url)
+            await self._refresh_subscriptions()
+        except Exception as exc:
+            logger.error("Rocket.Chat: authentication/subscription discovery failed: %s", exc)
+            await self.disconnect()
+            self._set_fatal_error("auth_failed", "Rocket.Chat authentication failed", retryable=False)
+            return False
+
+        self._ws_task = asyncio.create_task(self._realtime_loop())
+        self._refresh_task = asyncio.create_task(self._subscription_refresh_loop())
+        self._mark_connected()
+        return True
+
+    async def disconnect(self) -> None:
+        self._closing = True
+        for task in (self._refresh_task, self._ws_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        await self._ddp.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._mark_disconnected()
+        logger.info("Rocket.Chat: disconnected")
+
+    async def _realtime_loop(self) -> None:
+        attempt = 0
+        while not self._closing:
+            try:
+                await self._ddp.connect_once()
+                attempt = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._closing:
+                    break
+                attempt += 1
+                delay = min(_RECONNECT_BASE_DELAY * (2 ** min(attempt, 5)), _RECONNECT_MAX_DELAY)
+                delay += random.uniform(0, _RECONNECT_JITTER * delay)
+                logger.warning("Rocket.Chat: realtime disconnected (%s); reconnecting in %.1fs", exc, delay)
+                await asyncio.sleep(delay)
+
+    async def _subscription_refresh_loop(self) -> None:
+        while not self._closing:
+            try:
+                await asyncio.sleep(120)
+                await self._refresh_subscriptions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Rocket.Chat: subscription refresh failed: %s", exc)
+
+    async def _refresh_subscriptions(self) -> None:
+        data = await self._api_get("/api/v1/subscriptions.get")
+        subs = data.get("update") or data.get("subscriptions") or []
+        for sub in subs:
+            rid = str(sub.get("rid") or "").strip()
+            if not rid:
+                continue
+            self._rooms[rid] = _RoomInfo(
+                rid=rid,
+                name=str(sub.get("name") or ""),
+                fname=str(sub.get("fname") or ""),
+                t=str(sub.get("t") or "c"),
+            )
+            await self._ddp.subscribe_room(rid)
+        logger.info("Rocket.Chat: tracking %d subscribed rooms", len(self._rooms))
+
+    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        if not content:
+            return SendResult(success=True)
+        chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)
+        metadata = metadata or {}
+        thread_id = metadata.get("thread_id") or metadata.get("tmid") or reply_to
+        last_id = None
+        for chunk in chunks:
+            payload: dict[str, Any] = {"roomId": str(chat_id), "text": chunk}
+            if thread_id and self._should_thread(chunk):
+                payload["tmid"] = str(thread_id)
+            try:
+                data = await self._api_post("/api/v1/chat.postMessage", payload)
+                msg = data.get("message") or {}
+                last_id = msg.get("_id") or data.get("_id") or last_id
+            except Exception as exc:
+                logger.error("Rocket.Chat: send failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=str(last_id) if last_id else None)
+
+    def _should_thread(self, text: str) -> bool:
+        if self.reply_mode in {"off", "channel", "none", "false"}:
+            return False
+        if self.reply_mode == "auto":
+            return len(text) >= self.auto_thread_chars or text.count("\n") >= 3
+        return True
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            # Rocket.Chat's documented fallback is REST /api/v1/typing.
+            await self._api_post("/api/v1/typing", {"roomId": str(chat_id), "typing": True})
+        except Exception:
+            logger.debug("Rocket.Chat: typing indicator failed", exc_info=True)
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        try:
+            data = await self._api_post("/api/v1/chat.update", {"roomId": str(chat_id), "msgId": str(message_id), "text": content})
+            if data.get("success") is False:
+                return SendResult(success=False, error=str(data.get("error") or "edit failed"))
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        room = self._rooms.get(str(chat_id))
+        if room:
+            return {"name": room.display_name, "type": room.chat_type, "chat_id": room.rid}
+        return {"name": str(chat_id), "type": "channel", "chat_id": str(chat_id)}
+
+    def format_message(self, content: str) -> str:
+        # Rocket.Chat supports standard Markdown. Keep it, but turn image-only
+        # markdown into links unless native upload is used in a future phase.
+        return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", content or "")
+
+    def _room_cfg(self, rid: str) -> dict[str, Any]:
+        cfg = self.rooms_config.get(rid, {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _message_mentions_bot(self, msg: dict[str, Any], text: str) -> bool:
+        if not self._bot_username:
+            return False
+        if re.search(rf"(^|\s)@{re.escape(self._bot_username)}\b", text or "", re.IGNORECASE):
+            return True
+        for mention in msg.get("mentions") or []:
+            if mention.get("_id") == self.user_id or str(mention.get("username") or "").lower() == self._bot_username.lower():
+                return True
+        return False
+
+    def _should_process_room_message(self, rid: str, msg: dict[str, Any], text: str, room: _RoomInfo) -> bool:
+        room_cfg = self._room_cfg(rid)
+        require_mention = bool(room_cfg.get("require_mention", self.require_mention))
+        if room.chat_type == "dm":
+            return True
+        if require_mention:
+            return self._message_mentions_bot(msg, text)
+        return True
+
+    async def _handle_rc_message(self, msg: dict[str, Any]) -> None:
+        if not isinstance(msg, dict):
+            return
+        msg_id = str(msg.get("_id") or "")
+        rid = str(msg.get("rid") or "")
+        if not msg_id or not rid:
+            return
+        if self._dedup.is_duplicate(msg_id):
+            return
+        if msg.get("t"):
+            return  # system/control message
+        user = msg.get("u") or {}
+        user_id = str(user.get("_id") or "")
+        username = str(user.get("username") or user_id or "")
+        if user_id == self.user_id or (self._bot_username and username.lower() == self._bot_username.lower()):
+            return
+        ts = _date_to_epoch(msg.get("ts"))
+        if ts and time.time() - ts > _STALE_MESSAGE_AGE_SEC:
+            logger.debug("Rocket.Chat: dropped stale message %s", msg_id)
+            return
+
+        room = self._rooms.get(rid, _RoomInfo(rid=rid))
+        text = str(msg.get("msg") or "")
+        if not self._should_process_room_message(rid, msg, text, room):
+            return
+        clean_text = _strip_bot_mention(text, self._bot_username) if room.chat_type != "dm" else text
+        if not clean_text.strip() and not msg.get("file") and not msg.get("attachments"):
+            return
+
+        if self.ack_reaction:
+            asyncio.create_task(self._react(msg_id, str(self.ack_reaction)))
+        if self.mark_as_read:
+            asyncio.create_task(self._mark_read(rid))
+
+        tmid = str(msg.get("tmid") or "") or None
+        source = self.build_source(
+            chat_id=rid,
+            chat_name=room.display_name,
+            chat_type="thread" if tmid else room.chat_type,
+            user_id=username,          # human-friendly allowlist target
+            user_name=str(user.get("name") or username),
+            user_id_alt=user_id,
+            thread_id=tmid,
+            parent_chat_id=rid if tmid else None,
+            message_id=msg_id,
+        )
+        event = MessageEvent(
+            text=clean_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=msg,
+            message_id=msg_id,
+            reply_to_message_id=tmid,
+            timestamp=datetime.fromtimestamp(ts, timezone.utc) if ts else datetime.now(timezone.utc),
+        )
+        await self.handle_message(event)
+
+    async def _react(self, message_id: str, emoji: str) -> None:
+        normalized = emoji if emoji.startswith(":") else f":{emoji.strip(':')}:"
+        try:
+            await self._api_post("/api/v1/chat.react", {"messageId": message_id, "emoji": normalized, "shouldReact": True})
+        except Exception:
+            logger.debug("Rocket.Chat: reaction failed", exc_info=True)
+
+    async def _mark_read(self, rid: str) -> None:
+        try:
+            await self._api_post("/api/v1/subscriptions.read", {"rid": rid})
+        except Exception:
+            logger.debug("Rocket.Chat: mark-as-read failed", exc_info=True)
+
+
+def check_requirements() -> bool:
+    try:
+        import aiohttp  # noqa: F401
+        import websockets  # noqa: F401
+        return True
+    except ImportError:
+        logger.warning("Rocket.Chat: aiohttp and websockets are required")
+        return False
+
+
+def validate_config(config: PlatformConfig) -> bool:
+    extra = getattr(config, "extra", {}) or {}
+    return bool(
+        _normalize_url(extra.get("url") or extra.get("base_url") or os.getenv("ROCKETCHAT_URL", ""))
+        and (extra.get("user_id") or os.getenv("ROCKETCHAT_USER_ID", ""))
+        and (getattr(config, "token", None) or extra.get("auth_token") or os.getenv("ROCKETCHAT_AUTH_TOKEN", ""))
+    )
+
+
+def is_connected(config: PlatformConfig) -> bool:
+    return validate_config(config)
+
+
+def register(ctx) -> None:
+    ctx.register_platform(
+        name="rocketchat",
+        label="Rocket.Chat",
+        adapter_factory=lambda cfg: RocketChatAdapter(cfg),
+        check_fn=check_requirements,
+        validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["ROCKETCHAT_URL", "ROCKETCHAT_USER_ID", "ROCKETCHAT_AUTH_TOKEN"],
+        install_hint="Uses Hermes' aiohttp + websockets dependencies; no extra packages normally needed.",
+        allowed_users_env="ROCKETCHAT_ALLOWED_USERS",
+        allow_all_env="ROCKETCHAT_ALLOW_ALL_USERS",
+        max_message_length=MAX_MESSAGE_LENGTH,
+        emoji="🚀",
+        pii_safe=False,
+        allow_update_command=True,
+        platform_hint=(
+            "You are chatting via Rocket.Chat. Rocket.Chat supports standard Markdown, "
+            "channels, DMs, groups, and threads. Prefer concise replies in channels; "
+            "long or multi-part replies may be threaded by the adapter."
+        ),
+    )
