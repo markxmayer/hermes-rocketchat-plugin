@@ -619,9 +619,12 @@ class RocketChatAdapter(BasePlatformAdapter):
         return {"name": str(chat_id), "type": "channel", "chat_id": str(chat_id)}
 
     def format_message(self, content: str) -> str:
-        # Rocket.Chat supports standard Markdown. Keep it, but turn image-only
-        # markdown into links unless native upload is used in a future phase.
-        return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", content or "")
+        # Rocket.Chat supports standard Markdown. When the gateway extracts a
+        # local image/file for native upload, it can leave an empty markdown
+        # image stub like ![alt](); remove that instead of displaying it.
+        text = re.sub(r"!\[[^\]]*\]\(\s*\)", "", content or "")
+        text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", text)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
 
     def _room_cfg(self, rid: str) -> dict[str, Any]:
         cfg = self.rooms_config.get(rid, {})

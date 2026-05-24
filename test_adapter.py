@@ -23,6 +23,12 @@ def test_strip_bot_mention():
     assert adapter._strip_bot_mention("hey @Hermes please help", "hermes") == "hey please help"
 
 
+def test_format_message_removes_empty_markdown_image_artifact():
+    rc = _bare_adapter()
+    assert rc.format_message("Here you go:\n\n![Success — Hermes Rules]()") == "Here you go:"
+    assert rc.format_message("Before ![chart](/tmp/chart.png) after") == "Before /tmp/chart.png after"
+
+
 def test_register_platform_context():
     calls = []
     class Ctx:
