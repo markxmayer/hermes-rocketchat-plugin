@@ -137,3 +137,80 @@ def test_handle_rc_message_emits_photo_event_with_cached_image(monkeypatch):
     assert event.text == "what is in this image?"
     assert event.media_urls == ["/tmp/cached-rocketchat-image.jpg"]
     assert event.media_types == ["image/jpeg"]
+
+
+def test_send_image_file_uses_native_rooms_media_upload(monkeypatch, tmp_path):
+    rc = _bare_adapter()
+    image_path = tmp_path / "chart.png"
+    image_path.write_bytes(b"fake image bytes")
+    uploads = []
+
+    async def fake_send(chat_id, content, reply_to=None, metadata=None):
+        return adapter.SendResult(success=True, message_id="fallback-text")
+
+    async def fake_upload(chat_id, file_path, *, caption=None, file_name=None, reply_to=None, metadata=None):
+        uploads.append((chat_id, file_path, caption, file_name, reply_to, metadata))
+        return adapter.SendResult(success=True, message_id="uploaded-msg")
+
+    monkeypatch.setattr(rc, "send", fake_send)
+    monkeypatch.setattr(rc, "_upload_and_confirm_media", fake_upload, raising=False)
+
+    result = asyncio.run(rc.send_image_file("ROOM1", str(image_path), caption="Here is the chart", metadata={"thread_id": "thread1"}))
+
+    assert result.success is True
+    assert result.message_id == "uploaded-msg"
+    assert uploads == [("ROOM1", str(image_path), "Here is the chart", None, None, {"thread_id": "thread1"})]
+
+
+def test_send_document_uses_native_rooms_media_upload(monkeypatch, tmp_path):
+    rc = _bare_adapter()
+    doc_path = tmp_path / "report.pdf"
+    doc_path.write_bytes(b"%PDF fake")
+    uploads = []
+
+    async def fake_send(chat_id, content, reply_to=None, metadata=None):
+        return adapter.SendResult(success=True, message_id="fallback-text")
+
+    async def fake_upload(chat_id, file_path, *, caption=None, file_name=None, reply_to=None, metadata=None):
+        uploads.append((chat_id, file_path, caption, file_name, reply_to, metadata))
+        return adapter.SendResult(success=True, message_id="uploaded-doc")
+
+    monkeypatch.setattr(rc, "send", fake_send)
+    monkeypatch.setattr(rc, "_upload_and_confirm_media", fake_upload, raising=False)
+
+    result = asyncio.run(rc.send_document("ROOM1", str(doc_path), caption="PDF report", file_name="report.pdf", reply_to="root-msg"))
+
+    assert result.success is True
+    assert result.message_id == "uploaded-doc"
+    assert uploads == [("ROOM1", str(doc_path), "PDF report", "report.pdf", "root-msg", None)]
+
+
+def test_upload_and_confirm_media_sends_file_then_confirm_with_thread(monkeypatch):
+    rc = _bare_adapter()
+    calls = []
+
+    async def fake_api_upload_media(rid, file_path, *, file_name=None, content_type=None):
+        calls.append(("upload", rid, file_path, file_name, content_type))
+        return {"file": {"_id": "file123", "url": "/file-upload/file123/report.pdf"}, "success": True}
+
+    async def fake_api_post(path, payload):
+        calls.append(("post", path, payload))
+        return {"message": {"_id": "msg123"}, "success": True}
+
+    monkeypatch.setattr(rc, "_api_upload_media", fake_api_upload_media)
+    monkeypatch.setattr(rc, "_api_post", fake_api_post)
+
+    result = asyncio.run(rc._upload_and_confirm_media(
+        "ROOM 1",
+        "/tmp/report.pdf",
+        caption="Report attached",
+        file_name="report.pdf",
+        metadata={"thread_id": "thread42"},
+    ))
+
+    assert result.success is True
+    assert result.message_id == "msg123"
+    assert calls == [
+        ("upload", "ROOM 1", "/tmp/report.pdf", "report.pdf", None),
+        ("post", "/api/v1/rooms.mediaConfirm/ROOM%201/file123", {"msg": "Report attached", "tmid": "thread42"}),
+    ]

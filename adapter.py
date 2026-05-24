@@ -470,6 +470,132 @@ class RocketChatAdapter(BasePlatformAdapter):
             return len(text) >= self.auto_thread_chars or text.count("\n") >= 3
         return True
 
+    async def _api_upload_media(self, rid: str, file_path: str, *, file_name: Optional[str] = None, content_type: Optional[str] = None) -> dict[str, Any]:
+        if self._session is None:
+            raise RuntimeError("Rocket.Chat HTTP session is not connected")
+        import aiohttp
+
+        path_obj = Path(file_path).expanduser()
+        if not path_obj.is_file():
+            raise FileNotFoundError(str(path_obj))
+        upload_name = file_name or path_obj.name
+        media_type = content_type or mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+        url = urljoin(self.base_url + "/", f"api/v1/rooms.media/{quote(str(rid), safe='')}")
+        headers = dict(self._headers())
+        headers.pop("Content-Type", None)  # aiohttp sets multipart boundary.
+        for attempt in range(4):
+            form = aiohttp.FormData()
+            with path_obj.open("rb") as fh:
+                form.add_field("file", fh, filename=upload_name, content_type=media_type)
+                async with self._session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    body_text = await resp.text()
+                    if resp.status in {429, 502, 503, 504} and attempt < 3:
+                        await asyncio.sleep(self._retry_delay(resp, attempt))
+                        continue
+                    if resp.status >= 400:
+                        raise RuntimeError(f"POST /api/v1/rooms.media/{{rid}} failed HTTP {resp.status}: {body_text[:300]}")
+                    return json.loads(body_text or "{}")
+        return {}
+
+    async def _upload_and_confirm_media(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        metadata = metadata or {}
+        try:
+            upload = await self._api_upload_media(str(chat_id), file_path, file_name=file_name)
+            file_obj = upload.get("file") or {}
+            file_id = str(file_obj.get("_id") or upload.get("fileId") or "").strip()
+            if not file_id:
+                return SendResult(success=False, error="Rocket.Chat media upload did not return a file id", raw_response=upload)
+            payload: dict[str, Any] = {"msg": caption or ""}
+            thread_id = metadata.get("thread_id") or metadata.get("tmid") or reply_to
+            if thread_id:
+                payload["tmid"] = str(thread_id)
+            confirm = await self._api_post(f"/api/v1/rooms.mediaConfirm/{quote(str(chat_id), safe='')}/{quote(file_id, safe='')}", payload)
+            msg = confirm.get("message") or {}
+            msg_id = msg.get("_id") or confirm.get("_id") or file_id
+            return SendResult(success=True, message_id=str(msg_id), raw_response=confirm)
+        except Exception as exc:
+            logger.error("Rocket.Chat: native media upload failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._upload_and_confirm_media(
+            chat_id,
+            image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._upload_and_confirm_media(
+            chat_id,
+            file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._upload_and_confirm_media(
+            chat_id,
+            video_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._upload_and_confirm_media(
+            chat_id,
+            audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         try:
             # Rocket.Chat's documented fallback is REST /api/v1/typing.
