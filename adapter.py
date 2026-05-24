@@ -39,17 +39,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, cache_image_from_bytes
 from gateway.platforms.helpers import MessageDeduplicator
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,8 @@ _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
 _STALE_MESSAGE_AGE_SEC = 5 * 60
+_MAX_INBOUND_MEDIA_BYTES = int(os.getenv("ROCKETCHAT_MAX_INBOUND_MEDIA_BYTES", str(25 * 1024 * 1024)))
+_IMAGE_MIME_PREFIX = "image/"
 
 
 def _truthy(value: Any) -> bool:
@@ -170,7 +174,13 @@ class _DDPClient:
         self._active_rooms.clear()
         url = _websocket_url(self.adapter.base_url)
         logger.info("Rocket.Chat: connecting realtime websocket to %s", url)
-        async with websockets.connect(url, ping_interval=None, close_timeout=10) as ws:
+        async with websockets.connect(
+            url,
+            ping_interval=30,
+            ping_timeout=20,
+            close_timeout=10,
+            user_agent_header="HermesAgent RocketChatAdapter/0.1",
+        ) as ws:
             self.ws = ws
             await self.send_json({"msg": "connect", "version": "1", "support": ["1"]})
             async for raw in ws:
@@ -352,7 +362,10 @@ class RocketChatAdapter(BasePlatformAdapter):
             self._set_fatal_error("config_missing", "Rocket.Chat URL, user ID, or auth token missing", retryable=False)
             return False
 
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={"User-Agent": "HermesAgent RocketChatAdapter/0.1"},
+        )
         self._closing = False
         try:
             me = await self._api_get("/api/v1/me")
@@ -507,6 +520,129 @@ class RocketChatAdapter(BasePlatformAdapter):
             return self._message_mentions_bot(msg, text)
         return True
 
+    def _absolute_media_url(self, raw_url: str) -> str:
+        raw_url = str(raw_url or "").strip()
+        if not raw_url:
+            return ""
+        if raw_url.startswith(("http://", "https://")):
+            return raw_url
+        return urljoin(self.base_url + "/", raw_url.lstrip("/"))
+
+    @staticmethod
+    def _media_filename(candidate: dict[str, Any]) -> str:
+        for key in ("name", "title", "filename"):
+            value = str(candidate.get(key) or "").strip()
+            if value:
+                return Path(unquote(value)).name or "rocketchat-upload"
+        url = str(candidate.get("url") or "").strip()
+        if url:
+            return Path(unquote(urlsplit(url).path)).name or "rocketchat-upload"
+        return "rocketchat-upload"
+
+    @staticmethod
+    def _media_content_type(candidate: dict[str, Any]) -> str:
+        for key in ("type", "image_type", "content_type", "mime"):
+            value = str(candidate.get(key) or "").split(";", 1)[0].strip().lower()
+            if value:
+                return value
+        filename = RocketChatAdapter._media_filename(candidate)
+        guessed, _ = mimetypes.guess_type(filename)
+        return (guessed or "application/octet-stream").lower()
+
+    def _iter_inbound_media_candidates(self, msg: dict[str, Any]) -> Iterable[dict[str, Any]]:
+        """Yield Rocket.Chat file candidates, preferring original upload links."""
+        files: list[dict[str, Any]] = []
+        file_obj = msg.get("file")
+        if isinstance(file_obj, dict):
+            files.append(file_obj)
+        for item in msg.get("files") or []:
+            if isinstance(item, dict):
+                files.append(item)
+
+        file_by_id = {str(f.get("_id") or ""): f for f in files if f.get("_id")}
+        file_by_name = {str(f.get("name") or ""): f for f in files if f.get("name")}
+
+        for attachment in msg.get("attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            raw_url = str(attachment.get("title_link") or "").strip()
+            if not raw_url:
+                # Preview thumbnails are a fallback only; original title_link is better for vision.
+                raw_url = str(attachment.get("image_url") or "").strip()
+            if not raw_url:
+                continue
+            title = str(attachment.get("title") or "").strip()
+            file_id = ""
+            parts = [p for p in urlsplit(raw_url).path.split("/") if p]
+            if len(parts) >= 2 and parts[0] == "file-upload":
+                file_id = parts[1]
+            file_meta = file_by_id.get(file_id) or file_by_name.get(title) or {}
+            yield {
+                "url": self._absolute_media_url(raw_url),
+                "name": title or file_meta.get("name") or Path(unquote(urlsplit(raw_url).path)).name,
+                "type": file_meta.get("type") or attachment.get("image_type") or attachment.get("type"),
+            }
+
+        for file_meta in files:
+            file_id = str(file_meta.get("_id") or "").strip()
+            name = str(file_meta.get("name") or "").strip()
+            if not file_id or not name:
+                continue
+            yield {
+                "url": self._absolute_media_url(f"/file-upload/{quote(file_id)}/{quote(name)}"),
+                "name": name,
+                "type": file_meta.get("type"),
+            }
+
+    async def _extract_inbound_media(self, msg: dict[str, Any]) -> tuple[list[str], list[str]]:
+        media_paths: list[str] = []
+        media_types: list[str] = []
+        seen_urls: set[str] = set()
+        for candidate in self._iter_inbound_media_candidates(msg):
+            url = str(candidate.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            content_type = self._media_content_type(candidate)
+            if not content_type.startswith(_IMAGE_MIME_PREFIX):
+                continue
+            filename = self._media_filename(candidate)
+            try:
+                cached_path, cached_type = await self._download_inbound_media(url, filename, content_type)
+            except Exception as exc:
+                logger.warning("Rocket.Chat: failed to download inbound media %s: %s", urlsplit(url).path, exc)
+                continue
+            media_paths.append(cached_path)
+            media_types.append(cached_type or content_type)
+        return media_paths, media_types
+
+    async def _download_inbound_media(self, url: str, filename: str, content_type: str) -> tuple[str, str]:
+        """Download one authenticated Rocket.Chat image and cache it locally."""
+        if self._session is None:
+            raise RuntimeError("Rocket.Chat HTTP session is not connected")
+        import aiohttp
+
+        headers = dict(self._headers())
+        headers.pop("Content-Type", None)
+        headers["Accept"] = "image/*,*/*;q=0.8"
+        async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            body = await resp.read()
+            if resp.status >= 400:
+                snippet = body[:120].decode("utf-8", errors="replace")
+                raise RuntimeError(f"GET media failed HTTP {resp.status}: {snippet}")
+            size_header = str(resp.headers.get("Content-Length") or "").strip()
+            if size_header and int(size_header) > _MAX_INBOUND_MEDIA_BYTES:
+                raise RuntimeError(f"media file too large: {size_header} bytes")
+            if len(body) > _MAX_INBOUND_MEDIA_BYTES:
+                raise RuntimeError(f"media file too large: {len(body)} bytes")
+            response_type = str(resp.headers.get("Content-Type") or content_type or "").split(";", 1)[0].strip().lower()
+            if not response_type.startswith(_IMAGE_MIME_PREFIX):
+                raise RuntimeError(f"unsupported inbound media type: {response_type or 'unknown'}")
+            ext = mimetypes.guess_extension(response_type) or Path(filename).suffix or ".jpg"
+            if ext == ".jpe":
+                ext = ".jpg"
+            return cache_image_from_bytes(body, ext), response_type
+
     async def _handle_rc_message(self, msg: dict[str, Any]) -> None:
         if not isinstance(msg, dict):
             return
@@ -533,7 +669,8 @@ class RocketChatAdapter(BasePlatformAdapter):
         if not self._should_process_room_message(rid, msg, text, room):
             return
         clean_text = _strip_bot_mention(text, self._bot_username) if room.chat_type != "dm" else text
-        if not clean_text.strip() and not msg.get("file") and not msg.get("attachments"):
+        media_urls, media_types = await self._extract_inbound_media(msg)
+        if not clean_text.strip() and not media_urls and not msg.get("file") and not msg.get("attachments"):
             return
 
         if self.ack_reaction:
@@ -553,12 +690,15 @@ class RocketChatAdapter(BasePlatformAdapter):
             parent_chat_id=rid if tmid else None,
             message_id=msg_id,
         )
+        message_type = MessageType.PHOTO if any(mtype.startswith(_IMAGE_MIME_PREFIX) for mtype in media_types) else MessageType.TEXT
         event = MessageEvent(
             text=clean_text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             raw_message=msg,
             message_id=msg_id,
+            media_urls=media_urls,
+            media_types=media_types,
             reply_to_message_id=tmid,
             timestamp=datetime.fromtimestamp(ts, timezone.utc) if ts else datetime.now(timezone.utc),
         )
