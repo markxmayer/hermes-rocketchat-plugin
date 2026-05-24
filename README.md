@@ -1,0 +1,168 @@
+# Hermes Rocket.Chat Platform Plugin
+
+Update-safe Hermes user plugin that adds Rocket.Chat as a gateway platform.
+
+This package is meant to be copied into a Hermes profile under:
+
+```text
+~/.hermes/plugins/rocketchat
+```
+
+It registers the platform name:
+
+```text
+rocketchat
+```
+
+## What this upgrade provides
+
+- Rocket.Chat platform registration as a Hermes user plugin, no Hermes core patch required.
+- REST authentication against `/api/v1/me`.
+- Room discovery through `/api/v1/subscriptions.get`.
+- Realtime inbound messages through Rocket.Chat DDP `/websocket` and `stream-room-messages`.
+- Outbound text messages through `/api/v1/chat.postMessage`.
+- Thread-aware replies using Rocket.Chat `tmid`.
+- Mention/allowlist controls for safe bot access.
+- Reply modes: `thread`, `auto`, and channel/off behavior.
+- Ack reactions through `/api/v1/chat.react`.
+- Mark-as-read through `/api/v1/subscriptions.read`.
+- Typing indicator through `/api/v1/typing`.
+- Basic message edits through `/api/v1/chat.update`.
+- Message deletion through `/api/v1/chat.delete` for ephemeral cleanup flows.
+- Native outbound media uploads for images, documents, video, and voice/audio.
+- Generated Hermes images delivered as real Rocket.Chat attachments.
+- Remote image/GIF URL handling: download temporarily, size-check, upload natively, then clean up.
+- Thread-aware native media uploads.
+- Rocket.Chat native upload flow: `rooms.media/{rid}` plus `rooms.mediaConfirm`.
+- Cleanup of empty markdown artifacts such as `![title]()` after native file extraction.
+- Multiple-image sending via sequential native uploads.
+- Missed-message backfill on reconnect using recent room history endpoints.
+- Rocket.Chat-friendly text fallbacks for clarify/confirmation prompts where buttons are unavailable.
+- Test coverage for transport, upload, backfill, prompt fallback, and deletion behavior.
+
+## Files
+
+```text
+rocketchat/
+  __init__.py
+  adapter.py
+  plugin.yaml
+  test_adapter.py
+  README.md
+  HANDOFF.md
+```
+
+## Install
+
+1. Copy the extracted `rocketchat` directory to the target Hermes home:
+
+```bash
+mkdir -p ~/.hermes/plugins
+cp -R rocketchat ~/.hermes/plugins/rocketchat
+```
+
+2. Enable the plugin:
+
+```bash
+hermes plugins enable rocketchat-platform
+```
+
+3. Add Rocket.Chat credentials to `~/.hermes/.env` or Hermes config. Do not paste secrets into chat/logs.
+
+Minimum environment variables:
+
+```bash
+ROCKETCHAT_URL=https://your-rocket-chat.example.com
+ROCKETCHAT_USER_ID=your-bot-user-id
+ROCKETCHAT_AUTH_TOKEN=your-bot-auth-token
+ROCKETCHAT_ALLOWED_USERS=mark,jake
+```
+
+Common optional environment variables:
+
+```bash
+ROCKETCHAT_ALLOW_ALL_USERS=false
+ROCKETCHAT_HOME_CHANNEL=ROOM_ID
+ROCKETCHAT_REPLY_MODE=thread
+ROCKETCHAT_AUTO_THREAD_CHARS=280
+ROCKETCHAT_REQUIRE_MENTION=false
+ROCKETCHAT_ACK_REACTION=eyes
+ROCKETCHAT_MARK_AS_READ=true
+ROCKETCHAT_BACKFILL_ON_CONNECT=true
+ROCKETCHAT_BACKFILL_WINDOW_SECONDS=300
+```
+
+4. Enable the platform in `~/.hermes/config.yaml` if needed:
+
+```yaml
+gateway:
+  platforms:
+    rocketchat:
+      enabled: true
+      extra:
+        url: "https://your-rocket-chat.example.com"
+        user_id: "<bot user id>"
+        reply_mode: "thread"
+        auto_thread_chars: 280
+        require_mention: false
+        ack_reaction: "eyes"
+        mark_as_read: true
+        backfill_on_connect: true
+        backfill_window_seconds: 300
+```
+
+5. Restart Hermes gateway after installing or upgrading:
+
+```bash
+hermes gateway restart
+```
+
+Or foreground smoke test:
+
+```bash
+hermes gateway run
+```
+
+Expected startup log shape:
+
+```text
+Rocket.Chat: authenticated as @<botname> (...) on https://...
+Rocket.Chat: tracking N subscribed rooms
+Rocket.Chat: connecting realtime websocket to wss://.../websocket
+```
+
+## Verify
+
+From a Hermes source/venv install, adjust paths as needed:
+
+```bash
+python -m py_compile ~/.hermes/plugins/rocketchat/adapter.py
+python -m pytest ~/.hermes/plugins/rocketchat/test_adapter.py -q -o 'addopts='
+```
+
+Expected current result:
+
+```text
+14 passed
+```
+
+## Live smoke-test checklist
+
+- Send Hermes a normal text message from an allowed Rocket.Chat user.
+- Confirm Hermes replies in the expected room/thread.
+- Ask Hermes to generate or send an image and confirm it appears as a native Rocket.Chat attachment.
+- Send a remote image/GIF URL through a Hermes flow and confirm it uploads as an attachment, not just a bare URL.
+- Confirm a long reply or thread reply preserves `tmid` behavior according to configured reply mode.
+- Restart the gateway, send a message during downtime, then confirm recent-message backfill catches it after reconnect if within the backfill window.
+- Test `/approve`, `/always`, and `/cancel` style confirmation text in Rocket.Chat if using command approval flows.
+
+## Notes and caveats
+
+- This is a user plugin, not an upstream Hermes core platform.
+- It uses REST for stable operations and DDP only for inbound realtime delivery.
+- Rocket.Chat's DDP/realtime APIs are marked deprecated in current docs, but still remain useful for bot-style realtime inbound messages unless replacing with polling, webhooks, or a Rocket.Chat App.
+- Keep secrets in `.env` or config; never commit them into this plugin directory.
+
+## Attribution
+
+Reliability/protocol ideas were informed by Jake Miller's MIT `rocketchat-openclaw` plugin, then ported into Hermes-native Python/asyncio `BasePlatformAdapter` semantics.
