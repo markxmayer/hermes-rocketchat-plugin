@@ -43,6 +43,7 @@ import mimetypes
 import os
 import random
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -293,6 +294,8 @@ class RocketChatAdapter(BasePlatformAdapter):
         self.require_mention = bool(extra.get("require_mention", _truthy(os.getenv("ROCKETCHAT_REQUIRE_MENTION", "false"))))
         self.ack_reaction = extra.get("ack_reaction", os.getenv("ROCKETCHAT_ACK_REACTION", ""))
         self.mark_as_read = bool(extra.get("mark_as_read", _truthy(os.getenv("ROCKETCHAT_MARK_AS_READ", "false"))))
+        self.backfill_on_connect = bool(extra.get("backfill_on_connect", _truthy(os.getenv("ROCKETCHAT_BACKFILL_ON_CONNECT", "true"))))
+        self.backfill_window_seconds = int(extra.get("backfill_window_seconds") or os.getenv("ROCKETCHAT_BACKFILL_WINDOW_SECONDS", "300"))
         self.rooms_config: dict[str, Any] = extra.get("rooms", {}) if isinstance(extra.get("rooms"), dict) else {}
 
         self._session: Any = None
@@ -374,6 +377,8 @@ class RocketChatAdapter(BasePlatformAdapter):
             self._bot_name = str(user.get("name") or self._bot_username or self.user_id)
             logger.info("Rocket.Chat: authenticated as @%s (%s) on %s", self._bot_username, self.user_id, self.base_url)
             await self._refresh_subscriptions()
+            if self.backfill_on_connect:
+                await self._backfill_recent_messages(window_seconds=self.backfill_window_seconds)
         except Exception as exc:
             logger.error("Rocket.Chat: authentication/subscription discovery failed: %s", exc)
             await self.disconnect()
@@ -442,6 +447,39 @@ class RocketChatAdapter(BasePlatformAdapter):
             )
             await self._ddp.subscribe_room(rid)
         logger.info("Rocket.Chat: tracking %d subscribed rooms", len(self._rooms))
+
+    @staticmethod
+    def _history_endpoint_for_room(room: _RoomInfo) -> str:
+        if room.t == "d":
+            return "/api/v1/im.history"
+        if room.t in {"p", "g"}:
+            return "/api/v1/groups.history"
+        return "/api/v1/channels.history"
+
+    async def _backfill_recent_messages(self, *, window_seconds: int = 300) -> None:
+        """Best-effort startup/reconnect backfill for messages missed while DDP was down."""
+        if not self._rooms:
+            return
+        oldest_epoch = time.time() - max(1, int(window_seconds))
+        oldest = datetime.fromtimestamp(oldest_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+        for room in list(self._rooms.values()):
+            try:
+                data = await self._api_get(
+                    self._history_endpoint_for_room(room),
+                    params={
+                        "roomId": room.rid,
+                        "oldest": oldest,
+                        "inclusive": "true",
+                        "count": 50,
+                        "showThreadMessages": "true",
+                    },
+                )
+                messages = [m for m in data.get("messages") or [] if isinstance(m, dict)]
+                messages.sort(key=lambda m: _date_to_epoch(m.get("ts")) or 0)
+                for msg in messages:
+                    await self._handle_rc_message(msg)
+            except Exception as exc:
+                logger.debug("Rocket.Chat: backfill failed for room %s: %s", room.rid, exc)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not content:
@@ -526,6 +564,80 @@ class RocketChatAdapter(BasePlatformAdapter):
             logger.error("Rocket.Chat: native media upload failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def _download_remote_media_to_temp(self, url: str, *, suffix: str = "") -> tuple[str, str]:
+        if self._session is None:
+            raise RuntimeError("Rocket.Chat HTTP session is not connected")
+        if not str(url).startswith(("http://", "https://")):
+            raise ValueError("remote media URL must be http(s)")
+        import aiohttp
+
+        parsed = urlsplit(url)
+        name = Path(unquote(parsed.path)).name or "remote-media"
+        if not suffix:
+            suffix = Path(name).suffix
+        headers = {"Accept": "image/*,video/*,audio/*,application/octet-stream,*/*;q=0.8"}
+        async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            body = await resp.read()
+            if resp.status >= 400:
+                snippet = body[:120].decode("utf-8", errors="replace")
+                raise RuntimeError(f"GET remote media failed HTTP {resp.status}: {snippet}")
+            size_header = str(resp.headers.get("Content-Length") or "").strip()
+            if size_header and int(size_header) > _MAX_INBOUND_MEDIA_BYTES:
+                raise RuntimeError(f"remote media file too large: {size_header} bytes")
+            if len(body) > _MAX_INBOUND_MEDIA_BYTES:
+                raise RuntimeError(f"remote media file too large: {len(body)} bytes")
+            response_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if not suffix and response_type:
+                suffix = mimetypes.guess_extension(response_type) or ""
+            fd, tmp_path = tempfile.mkstemp(prefix="rocketchat-remote-", suffix=suffix or Path(name).suffix)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+            upload_name = name if Path(name).suffix else f"{name}{suffix}"
+            return tmp_path, upload_name
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if image_url.startswith("file://"):
+            return await self.send_image_file(chat_id, unquote(image_url[7:]), caption=caption, reply_to=reply_to, metadata=metadata)
+        if image_url.startswith(("http://", "https://")):
+            tmp_path, upload_name = await self._download_remote_media_to_temp(image_url, suffix=Path(urlsplit(image_url).path).suffix or ".png")
+            try:
+                return await self._upload_and_confirm_media(chat_id, tmp_path, caption=caption, file_name=upload_name, reply_to=reply_to, metadata=metadata)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        return await self.send(chat_id=chat_id, content=f"{caption}\n{image_url}" if caption else image_url, reply_to=reply_to, metadata=metadata)
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self.send_image(chat_id, animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: list[tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        for image_url, alt_text in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            await self.send_image(chat_id, image_url, caption=alt_text or None, metadata=metadata)
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -602,6 +714,53 @@ class RocketChatAdapter(BasePlatformAdapter):
             await self._api_post("/api/v1/typing", {"roomId": str(chat_id), "typing": True})
         except Exception:
             logger.debug("Rocket.Chat: typing indicator failed", exc_info=True)
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        try:
+            data = await self._api_post(
+                "/api/v1/chat.delete",
+                {"roomId": str(chat_id), "msgId": str(message_id), "asUser": False},
+            )
+            return data.get("success") is not False
+        except Exception:
+            logger.debug("Rocket.Chat: delete message failed", exc_info=True)
+            return False
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        text = f"⚠️ {title}\n\n{message}\n\nReply with /approve, /always, or /cancel."
+        return await self.send(chat_id=chat_id, content=text, metadata=metadata)
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if choices:
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+                mark_awaiting_text(clarify_id)
+            except Exception:
+                logger.debug("Rocket.Chat: clarify text-capture registration failed", exc_info=True)
+            lines = [f"❓ {question}", ""]
+            for i, choice in enumerate(choices, start=1):
+                lines.append(f"{i}. {choice}")
+            lines.extend(["", "Reply with the number, option text, or your own answer."])
+            text = "\n".join(lines)
+        else:
+            text = f"❓ {question}"
+        return await self.send(chat_id=chat_id, content=text, metadata=metadata)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         try:

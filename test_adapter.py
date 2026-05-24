@@ -220,3 +220,93 @@ def test_upload_and_confirm_media_sends_file_then_confirm_with_thread(monkeypatc
         ("upload", "ROOM 1", "/tmp/report.pdf", "report.pdf", None),
         ("post", "/api/v1/rooms.mediaConfirm/ROOM%201/file123", {"msg": "Report attached", "tmid": "thread42"}),
     ]
+
+
+def test_delete_message_calls_rocketchat_delete(monkeypatch):
+    rc = _bare_adapter()
+    calls = []
+
+    async def fake_api_post(path, payload):
+        calls.append((path, payload))
+        return {"success": True}
+
+    monkeypatch.setattr(rc, "_api_post", fake_api_post)
+
+    assert asyncio.run(rc.delete_message("ROOM1", "msg123")) is True
+    assert calls == [("/api/v1/chat.delete", {"roomId": "ROOM1", "msgId": "msg123", "asUser": False})]
+
+
+def test_send_remote_image_downloads_then_uploads(monkeypatch):
+    rc = _bare_adapter()
+    calls = []
+
+    async def fake_download(url, *, suffix=""):
+        calls.append(("download", url, suffix))
+        return "/tmp/remote-image.png", "remote-image.png"
+
+    async def fake_upload(chat_id, file_path, *, caption=None, file_name=None, reply_to=None, metadata=None):
+        calls.append(("upload", chat_id, file_path, caption, file_name, reply_to, metadata))
+        return adapter.SendResult(success=True, message_id="remote-uploaded")
+
+    monkeypatch.setattr(rc, "_download_remote_media_to_temp", fake_download, raising=False)
+    monkeypatch.setattr(rc, "_upload_and_confirm_media", fake_upload)
+
+    result = asyncio.run(rc.send_image("ROOM1", "https://cdn.example.com/image.png", caption="remote", metadata={"thread_id": "t1"}))
+
+    assert result.success is True
+    assert result.message_id == "remote-uploaded"
+    assert calls == [
+        ("download", "https://cdn.example.com/image.png", ".png"),
+        ("upload", "ROOM1", "/tmp/remote-image.png", "remote", "remote-image.png", None, {"thread_id": "t1"}),
+    ]
+
+
+def test_backfill_recent_messages_uses_room_history_and_chronological_order(monkeypatch):
+    rc = _bare_adapter()
+    rc._rooms = {
+        "CHAN": adapter._RoomInfo(rid="CHAN", name="general", t="c"),
+        "GROUP": adapter._RoomInfo(rid="GROUP", name="secret", t="p"),
+        "DM": adapter._RoomInfo(rid="DM", name="mark", t="d"),
+    }
+    api_calls = []
+    handled = []
+
+    async def fake_api_get(path, *, params=None):
+        api_calls.append((path, params))
+        return {"messages": [
+            {"_id": f"{path}-new", "rid": params["roomId"], "msg": "new", "ts": {"$date": 2000}},
+            {"_id": f"{path}-old", "rid": params["roomId"], "msg": "old", "ts": {"$date": 1000}},
+        ], "success": True}
+
+    async def fake_handle(msg):
+        handled.append(msg["_id"])
+
+    monkeypatch.setattr(rc, "_api_get", fake_api_get)
+    monkeypatch.setattr(rc, "_handle_rc_message", fake_handle)
+
+    asyncio.run(rc._backfill_recent_messages(window_seconds=300))
+
+    assert [call[0] for call in api_calls] == ["/api/v1/channels.history", "/api/v1/groups.history", "/api/v1/im.history"]
+    assert handled == [
+        "/api/v1/channels.history-old", "/api/v1/channels.history-new",
+        "/api/v1/groups.history-old", "/api/v1/groups.history-new",
+        "/api/v1/im.history-old", "/api/v1/im.history-new",
+    ]
+
+
+def test_send_clarify_and_slash_confirm_use_text_fallback(monkeypatch):
+    rc = _bare_adapter()
+    sent = []
+
+    async def fake_send(chat_id, content, reply_to=None, metadata=None):
+        sent.append((chat_id, content, metadata))
+        return adapter.SendResult(success=True, message_id="sent")
+
+    monkeypatch.setattr(rc, "send", fake_send)
+
+    clarify = asyncio.run(rc.send_clarify("ROOM1", "Pick one", ["A", "B"], "clarify1", "session1", metadata={"thread_id": "t"}))
+    confirm = asyncio.run(rc.send_slash_confirm("ROOM1", "Reload MCP?", "This reloads tools", "session1", "confirm1"))
+
+    assert clarify.success is True and confirm.success is True
+    assert "Pick one" in sent[0][1] and "1. A" in sent[0][1] and "2. B" in sent[0][1]
+    assert "Reload MCP?" in sent[1][1] and "/approve" in sent[1][1] and "/cancel" in sent[1][1]
