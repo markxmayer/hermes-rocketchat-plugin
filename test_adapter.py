@@ -455,6 +455,38 @@ def test_e2e_requests_room_key_via_notify_room_users_stream():
     assert message["params"] == ["ROOM1/e2ekeyRequest", "ROOM1", "kid1"]
 
 
+def test_e2e_resets_existing_room_key_with_official_endpoint():
+    e2e = adapter._load_e2e_module()
+    posts = []
+
+    async def fake_get(path, *, params=None):
+        return {"success": True}
+
+    async def fake_post(path, payload):
+        posts.append((path, payload))
+        if path == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey":
+            return {"success": True, "message": adapter.json.dumps({"result": {"users": []}})}
+        return {"success": True}
+
+    async def run():
+        helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
+        public_key, private_key = e2e.generate_rsa_jwks()
+        helper.public_key_json = public_key
+        helper.private_key_json = private_key
+        helper.private_key = e2e.private_key_from_jwk(adapter.json.loads(private_key))
+        state = await helper.reset_room_key("ROOM1")
+        assert helper.have_room("ROOM1") is True
+        assert state.kid
+
+    asyncio.run(run())
+
+    assert posts[0][0] == "/api/v1/e2e.resetRoomKey"
+    payload = posts[0][1]
+    assert payload["rid"] == "ROOM1"
+    assert isinstance(payload["e2eKeyId"], str) and payload["e2eKeyId"]
+    assert isinstance(payload["e2eKey"], str) and payload["e2eKey"]
+
+
 def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
     e2e = adapter._load_e2e_module()
     peer_public, _peer_private = e2e.generate_rsa_jwks()
