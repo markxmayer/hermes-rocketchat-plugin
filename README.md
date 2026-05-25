@@ -54,6 +54,7 @@ rocketchat/
   test_adapter.py
   README.md
   HANDOFF.md
+  AGENTS.md
 ```
 
 ## Install

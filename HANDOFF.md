@@ -22,6 +22,7 @@ rocketchat/plugin.yaml
 rocketchat/test_adapter.py
 rocketchat/README.md
 rocketchat/HANDOFF.md
+rocketchat/AGENTS.md
 ```
 
 Platform registration:
@@ -42,7 +43,7 @@ Current local commit used for packaging:
 to be filled by packager; latest feature baseline is 49759d7 feat: add persistent Rocket.Chat E2E mode
 ```
 
-Plugin version: `0.2.0`
+Plugin version: `0.2.1`
 
 ## Current capabilities
 
