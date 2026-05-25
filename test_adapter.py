@@ -406,6 +406,30 @@ def test_e2e_start_force_replaces_unreadable_existing_identity():
     assert posts[0][1]["force"] is True
 
 
+def test_e2e_rejects_unreadable_suggested_room_key():
+    e2e = adapter._load_e2e_module()
+    posts = []
+
+    async def fake_get(path, *, params=None):
+        return {"success": True}
+
+    async def fake_post(path, payload):
+        posts.append((path, payload))
+        return {"success": True}
+
+    async def run():
+        helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
+        public_key, private_key = e2e.generate_rsa_jwks()
+        helper.public_key_json = public_key
+        helper.private_key_json = private_key
+        helper.private_key = e2e.private_key_from_jwk(adapter.json.loads(private_key))
+        assert await helper.accept_suggested_key("ROOM1", "not-a-valid-key") is False
+
+    asyncio.run(run())
+
+    assert posts == [("/api/v1/e2e.rejectSuggestedGroupKey", {"rid": "ROOM1"})]
+
+
 def test_handle_rc_message_decrypts_e2e_dm_before_emitting(monkeypatch):
     rc = _bare_adapter()
     rc.e2e_enabled = True

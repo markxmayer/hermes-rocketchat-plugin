@@ -390,7 +390,10 @@ class RocketChatE2E:
     async def accept_suggested_key(self, rid: str, suggested_key: str) -> bool:
         if not suggested_key:
             return False
-        ok = self.import_room_key(rid, suggested_key)
+        try:
+            ok = self.import_room_key(rid, suggested_key)
+        except Exception:
+            ok = False
         if ok:
             await self._rest_post("/api/v1/e2e.acceptSuggestedGroupKey", {"rid": rid})
         else:
