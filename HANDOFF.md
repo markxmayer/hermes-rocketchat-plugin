@@ -1,6 +1,6 @@
 # Rocket.Chat Hermes gateway plugin handoff
 
-Date: 2026-05-24
+Date: 2026-05-25
 
 Goal: provide an update-safe Hermes-native Rocket.Chat gateway plugin usable by Mark and Jake. It is a Python/asyncio Hermes user plugin, not an OpenClaw shim, though Jake Miller's MIT `rocketchat-openclaw` plugin was used as a protocol/reliability reference.
 
@@ -17,6 +17,7 @@ Packaged files:
 ```text
 rocketchat/__init__.py
 rocketchat/adapter.py
+rocketchat/e2e.py
 rocketchat/plugin.yaml
 rocketchat/test_adapter.py
 rocketchat/README.md
@@ -38,8 +39,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-8a40f19 feat: complete Rocket.Chat media and reliability helpers
+to be filled by packager; latest feature baseline is 49759d7 feat: add persistent Rocket.Chat E2E mode
 ```
+
+Plugin version: `0.2.0`
 
 ## Current capabilities
 
@@ -65,6 +68,10 @@ Current local commit used for packaging:
 - Multiple-image sending through sequential native uploads.
 - Recent-message backfill on reconnect through `channels.history`, `groups.history`, and `im.history`.
 - Rocket.Chat-friendly text fallbacks for clarify and slash-confirm flows.
+- Optional DM-only Rocket.Chat E2EE support.
+- One-shot encrypted DM exchanges with `/e2e`.
+- Persistent encrypted DM mode with `/e2e on`; disable while encrypted by sending `e2e off` as plain text inside the encrypted room. Rocket.Chat blocks slash commands while the room is encrypted.
+- E2E key-sharing helpers for existing rooms, stale-key rotation fallback, and bot key-share queueing without rotating the bot RSA identity.
 
 ## Verification run
 
@@ -79,7 +86,7 @@ python -m pytest test_adapter.py -q -o 'addopts='
 Expected result:
 
 ```text
-14 passed
+34 passed
 ```
 
 ## Configuration
@@ -105,6 +112,12 @@ ROCKETCHAT_ACK_REACTION=eyes
 ROCKETCHAT_MARK_AS_READ=true
 ROCKETCHAT_BACKFILL_ON_CONNECT=true
 ROCKETCHAT_BACKFILL_WINDOW_SECONDS=300
+
+# Optional DM-only E2EE. If this file is absent and E2E is enabled,
+# Hermes generates a local recovery password file with mode 0600.
+ROCKETCHAT_E2E_ENABLED=true
+ROCKETCHAT_E2E_DM_ONLY=true
+ROCKETCHAT_E2E_PASSWORD_FILE=~/.hermes/secrets/rocketchat-e2e.env
 ```
 
 Example config:
@@ -124,6 +137,10 @@ gateway:
         mark_as_read: true
         backfill_on_connect: true
         backfill_window_seconds: 300
+        e2e:
+          enabled: true
+          dm_only: true
+          password_file: "~/.hermes/secrets/rocketchat-e2e.env"
 ```
 
 ## Install/upgrade quick path
@@ -146,6 +163,8 @@ Restarting the gateway is required for plugin code changes to load.
 5. Test a remote image/GIF URL flow and confirm native upload instead of bare URL output.
 6. Confirm command approvals render usable `/approve`, `/always`, `/cancel` text prompts.
 7. Restart gateway and test whether messages sent during a short downtime are recovered by backfill.
+8. For one-shot E2E: send `/e2e`, wait for ready, send one encrypted message, and confirm Hermes answers encrypted then returns the DM to plaintext.
+9. For persistent E2E: send `/e2e on`, wait for persistent-ready, chat for multiple turns, then send encrypted `e2e off` and confirm the DM returns to plaintext.
 
 ## Protocol notes
 
