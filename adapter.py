@@ -510,6 +510,8 @@ class RocketChatAdapter(BasePlatformAdapter):
                 messages = [m for m in data.get("messages") or [] if isinstance(m, dict)]
                 messages.sort(key=lambda m: _date_to_epoch(m.get("ts")) or 0)
                 for msg in messages:
+                    msg = dict(msg)
+                    msg["__hermes_backfill"] = True
                     await self._handle_rc_message(msg)
             except Exception as exc:
                 logger.debug("Rocket.Chat: backfill failed for room %s: %s", room.rid, exc)
@@ -1197,7 +1199,7 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         room = self._rooms.get(rid, room)
         text = str(msg.get("msg") or "")
-        if await self._handle_e2e_command(room, text):
+        if not msg.get("__hermes_backfill") and await self._handle_e2e_command(room, text):
             return
         if msg_type == "e2e" and self._e2e_armed_until.get(rid, 0) > time.time():
             self._e2e_disable_after_reply.add(rid)
