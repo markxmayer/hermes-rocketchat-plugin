@@ -84,19 +84,21 @@ If key sharing for a room appears stale, prefer the built-in room-key request an
 
 One-shot mode:
 
-1. User sends `/e2e` in a DM.
+1. User sends `e2e1` in a DM.
 2. Hermes prepares the room key and replies with a plaintext ready message.
 3. User sends one encrypted message.
 4. Hermes decrypts, answers encrypted, then disables room E2E again.
 
 Persistent mode:
 
-1. User sends `/e2e on` in a plaintext DM.
+1. User sends `e2e_on` in a plaintext DM.
 2. Hermes prepares E2E and replies with persistent-ready.
 3. User can continue chatting across multiple encrypted turns.
-4. To turn persistent mode off, user sends `e2e off` as a normal encrypted message.
+4. To turn persistent mode off, user sends encrypted `e2e_off`.
 
-Important Rocket.Chat behavior: slash commands are blocked while a room is encrypted, so `/e2e off` will not work inside persistent encrypted mode. Use encrypted plain text `e2e off`, `e2e status`, or `e2e cancel`.
+Status: send `e2e_status` before encryption or encrypted `e2e_status` during persistent mode.
+
+Important Rocket.Chat behavior: slash aliases such as `/e2e` are accepted for compatibility, but they may trigger Rocket.Chat parser warnings, and slash commands can be blocked while a room is encrypted. Prefer deliberate non-slash controls: `e2e1`, `e2e_on`, `e2e_off`, `e2e_status`.
 
 ## Development rules
 
@@ -115,10 +117,10 @@ Use the Hermes source venv if the system Python lacks pytest:
 /Users/mark/.hermes/hermes-agent/venv/bin/python -m pytest test_adapter.py -q -o 'addopts='
 ```
 
-Expected result for v0.2.x:
+Expected result for v0.3.x:
 
 ```text
-34 passed
+41 passed
 ```
 
 For a recipient install, verify from the extracted archive, not just the source tree.

@@ -84,6 +84,11 @@ def _bare_adapter():
     rc._e2e_armed_until = {}
     rc._e2e_disable_after_reply = set()
     rc._e2e_persistent_rooms = set()
+    rc._e2e_pending_ready_tasks = {}
+    rc.e2e_key_wait_attempts = 24
+    rc.e2e_key_wait_delay = 1.25
+    rc.e2e_background_wait_attempts = 48
+    rc.e2e_background_wait_delay = 2.5
     return rc
 
 
@@ -299,6 +304,121 @@ def test_backfill_recent_messages_uses_room_history_and_chronological_order(monk
         "/api/v1/groups.history-old", "/api/v1/groups.history-new",
         "/api/v1/im.history-old", "/api/v1/im.history-new",
     ]
+
+
+def test_persistent_seen_messages_survive_adapter_restart(tmp_path):
+    state_path = tmp_path / "seen.json"
+    first = _bare_adapter()
+    first._persistent_seen_path = state_path
+    first._persistent_seen_ids = set()
+    first._persistent_seen_order = []
+
+    assert first._remember_persistent_seen_message("msg-1") is False
+    assert first._remember_persistent_seen_message("msg-1") is True
+
+    second = _bare_adapter()
+    second._persistent_seen_path = state_path
+    second._load_persistent_seen_messages()
+
+    assert second._remember_persistent_seen_message("msg-1") is True
+    assert second._remember_persistent_seen_message("msg-2") is False
+
+
+def test_handle_rc_message_skips_restart_persistent_duplicate(monkeypatch, tmp_path):
+    rc = _bare_adapter()
+    rc._persistent_seen_path = tmp_path / "seen.json"
+    rc._persistent_seen_ids = {"msg1"}
+    rc._persistent_seen_order = ["msg1"]
+    events = []
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+
+    msg = {
+        "_id": "msg1",
+        "rid": "ROOM1",
+        "msg": "test",
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert events == []
+
+
+def test_handle_e2e_command_schedules_delayed_ready_watch_when_key_missing(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    rc._e2e = object()
+    room = adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True, e2e_key_id="key1")
+    rc._rooms = {"ROOM1": room}
+    sent = []
+    scheduled = []
+
+    async def fake_ensure(room_arg, *, wait_for_key=True):
+        assert wait_for_key is False
+        return False, "missing key"
+
+    async def fake_send_plain(rid, content):
+        sent.append((rid, content))
+        return adapter.SendResult(success=True, message_id="sent")
+
+    def fake_schedule(room_arg, *, persistent):
+        scheduled.append((room_arg.rid, persistent))
+
+    monkeypatch.setattr(rc, "_ensure_e2e_exchange_ready", fake_ensure)
+    monkeypatch.setattr(rc, "_send_plain_text", fake_send_plain)
+    monkeypatch.setattr(rc, "_schedule_e2e_ready_watch", fake_schedule)
+
+    handled = asyncio.run(rc._handle_e2e_command(room, "e2e1"))
+
+    assert handled is True
+    assert scheduled == [("ROOM1", False)]
+    assert "should not need to send `e2e1` again" in sent[0][1]
+
+
+def test_plain_e2e_word_does_not_trigger_control_command(monkeypatch):
+    rc = _bare_adapter()
+    sent = []
+
+    async def fake_send_plain(rid, content):
+        sent.append((rid, content))
+        return adapter.SendResult(success=True)
+
+    monkeypatch.setattr(rc, "_send_plain_text", fake_send_plain)
+
+    assert asyncio.run(rc._handle_e2e_command(rc._rooms["ROOM1"], "e2e")) is False
+    assert asyncio.run(rc._handle_e2e_command(rc._rooms["ROOM1"], "let's talk about e2e")) is False
+    assert sent == []
+
+
+def test_delayed_e2e_ready_watch_arms_and_announces(monkeypatch):
+    rc = _bare_adapter()
+    room = adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True, e2e_key_id="key1")
+    rc._rooms = {"ROOM1": room}
+    sent = []
+
+    async def fake_wait(room_arg, *, attempts=None, delay=None):
+        assert attempts == rc.e2e_background_wait_attempts
+        assert delay == rc.e2e_background_wait_delay
+        return True
+
+    async def fake_send_plain(rid, content):
+        sent.append((rid, content))
+        return adapter.SendResult(success=True, message_id="sent")
+
+    monkeypatch.setattr(rc, "_wait_for_e2e_room_key", fake_wait)
+    monkeypatch.setattr(rc, "_send_plain_text", fake_send_plain)
+    rc._e2e_pending_ready_tasks["ROOM1"] = SimpleNamespace(done=lambda: False)
+
+    asyncio.run(rc._e2e_ready_watch_loop(room, persistent=False))
+
+    assert sent == [("ROOM1", rc._e2e_ready_message(persistent=False))]
+    assert rc._e2e_armed_until["ROOM1"] > time.time()
+    assert "ROOM1" not in rc._e2e_pending_ready_tasks
 
 
 def test_send_clarify_and_slash_confirm_use_text_fallback(monkeypatch):
@@ -552,6 +672,44 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
     assert isinstance(suggestions[0]["key"], str) and suggestions[0]["key"]
 
 
+def test_refresh_subscriptions_does_not_treat_cached_e2e_key_as_room_encrypted(monkeypatch):
+    rc = _bare_adapter()
+    rc._rooms = {}
+    subscribed = []
+    prepared = []
+
+    async def fake_api_get(path):
+        assert path == "/api/v1/subscriptions.get"
+        return {
+            "update": [{
+                "rid": "ROOM1",
+                "name": "mark",
+                "t": "d",
+                "encrypted": False,
+                "E2EKey": "cached-room-key",
+                "e2eKeyId": "kid1",
+            }]
+        }
+
+    async def fake_prepare(room):
+        prepared.append((room.rid, room.encrypted, bool(room.e2e_key)))
+        return False
+
+    rc._ddp = SimpleNamespace(subscribe_room=lambda rid: subscribed.append(rid))
+    async def fake_subscribe_room(rid):
+        subscribed.append(rid)
+    rc._ddp.subscribe_room = fake_subscribe_room
+    monkeypatch.setattr(rc, "_api_get", fake_api_get)
+    monkeypatch.setattr(rc, "_prepare_e2e_room", fake_prepare)
+
+    asyncio.run(rc._refresh_subscriptions())
+
+    assert rc._rooms["ROOM1"].encrypted is False
+    assert rc._rooms["ROOM1"].e2e_key == "cached-room-key"
+    assert prepared == [("ROOM1", False, True)]
+    assert subscribed == ["ROOM1"]
+
+
 def test_handle_room_e2e_toggle_refreshes_subscriptions(monkeypatch):
     rc = _bare_adapter()
     rc.e2e_enabled = True
@@ -627,6 +785,63 @@ def test_handle_e2e_message_marks_room_encrypted_and_refreshes_before_decrypt(mo
 
     assert refreshes == [True]
     assert events[0].text == "decrypted after refresh"
+
+
+def test_handle_e2e_message_uses_rooms_info_when_subscription_encrypted_flag_lags(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=False)}
+    rc._e2e = object()
+    seen = []
+    events = []
+
+    async def fake_refresh_subscriptions():
+        # Mirrors Rocket.Chat live behavior seen during testing: room is encrypted
+        # according to rooms.info, but subscriptions.get still reports encrypted=false.
+        rc._rooms["ROOM1"] = adapter._RoomInfo(
+            rid="ROOM1",
+            name="mark",
+            t="d",
+            encrypted=False,
+            e2e_key="cached-room-key",
+            e2e_key_id="kid1",
+        )
+
+    async def fake_refresh_room_info(room_info):
+        room_info.encrypted = True
+        rc._rooms[room_info.rid] = room_info
+        return room_info
+
+    async def fake_decrypt(msg, room_info):
+        seen.append((room_info.encrypted, room_info.e2e_key))
+        out = dict(msg)
+        out["e2e"] = "done"
+        out["msg"] = "decrypted after authoritative room refresh"
+        return out
+
+    monkeypatch.setattr(rc, "_refresh_subscriptions", fake_refresh_subscriptions)
+    monkeypatch.setattr(rc, "_refresh_room_info", fake_refresh_room_info)
+    monkeypatch.setattr(rc, "_decrypt_e2e_message", fake_decrypt)
+    monkeypatch.setattr(rc, "build_source", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+
+    msg = {
+        "_id": "e2e-lag-msg1",
+        "rid": "ROOM1",
+        "t": "e2e",
+        "content": {"algorithm": "rc.v2.aes-sha2", "kid": "kid", "iv": "iv", "ciphertext": "ct"},
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert seen == [(True, "cached-room-key")]
+    assert events[0].text == "decrypted after authoritative room refresh"
 
 
 def test_handle_rc_message_decrypts_e2e_dm_before_emitting(monkeypatch):
@@ -710,7 +925,8 @@ def test_e2e_command_arms_one_shot_exchange(monkeypatch):
     sent = []
     prepared = []
 
-    async def fake_ready(room):
+    async def fake_ready(room, *, wait_for_key=True):
+        assert wait_for_key is False
         prepared.append(room.rid)
         return True, "E2E ready. Send one encrypted message now."
 
@@ -724,7 +940,7 @@ def test_e2e_command_arms_one_shot_exchange(monkeypatch):
     msg = {
         "_id": "cmd-e2e",
         "rid": "ROOM1",
-        "msg": "/e2e",
+        "msg": "e2e1",
         "ts": {"$date": int(time.time() * 1000)},
         "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
     }
@@ -742,7 +958,8 @@ def test_e2e_command_enables_persistent_mode(monkeypatch):
     rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=False)}
     sent = []
 
-    async def fake_ready(room):
+    async def fake_ready(room, *, wait_for_key=True):
+        assert wait_for_key is False
         return True, "ready"
 
     async def fake_plain(chat_id, content):
@@ -755,7 +972,7 @@ def test_e2e_command_enables_persistent_mode(monkeypatch):
     msg = {
         "_id": "cmd-e2e-on",
         "rid": "ROOM1",
-        "msg": "/e2e on",
+        "msg": "e2e_on",
         "ts": {"$date": int(time.time() * 1000)},
         "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
     }
@@ -786,7 +1003,7 @@ def test_e2e_status_command_is_handled_locally(monkeypatch):
     msg = {
         "_id": "cmd-status",
         "rid": "ROOM1",
-        "msg": "/e2e status",
+        "msg": "e2e_status",
         "ts": {"$date": int(time.time() * 1000)},
         "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
     }
@@ -814,7 +1031,7 @@ def test_e2e_cancel_command_disarms_and_restores_plaintext(monkeypatch):
     msg = {
         "_id": "cmd-cancel",
         "rid": "ROOM1",
-        "msg": "/e2e cancel",
+        "msg": "e2e_off",
         "ts": {"$date": int(time.time() * 1000)},
         "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
     }
@@ -962,7 +1179,7 @@ def test_encrypted_e2e_off_disables_persistent_mode(monkeypatch):
 
     async def fake_decrypt(msg, room_info):
         out = dict(msg)
-        out["msg"] = "e2e off"
+        out["msg"] = "e2e_off"
         out["e2e"] = "done"
         return out
 

@@ -66,6 +66,11 @@ _RECONNECT_JITTER = 0.2
 _STALE_MESSAGE_AGE_SEC = 5 * 60
 _MAX_INBOUND_MEDIA_BYTES = int(os.getenv("ROCKETCHAT_MAX_INBOUND_MEDIA_BYTES", str(25 * 1024 * 1024)))
 _IMAGE_MIME_PREFIX = "image/"
+_PERSISTENT_DEDUP_MAX_IDS = 2000
+
+
+def _default_state_dir() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "state"
 
 
 def _load_e2e_module():
@@ -320,6 +325,10 @@ class RocketChatAdapter(BasePlatformAdapter):
         self.e2e_password_file = str(e2e_cfg.get("password_file") or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""))
         self.e2e_auto_create_dm_key = bool(e2e_cfg.get("auto_create_dm_key", _truthy(os.getenv("ROCKETCHAT_E2E_AUTO_CREATE_DM_KEY", "false"))))
         self.e2e_force_unreadable_identity = bool(e2e_cfg.get("force_unreadable_identity", _truthy(os.getenv("ROCKETCHAT_E2E_FORCE_UNREADABLE_IDENTITY", "false"))))
+        self.e2e_key_wait_attempts = int(e2e_cfg.get("key_wait_attempts") or os.getenv("ROCKETCHAT_E2E_KEY_WAIT_ATTEMPTS", "24"))
+        self.e2e_key_wait_delay = float(e2e_cfg.get("key_wait_delay") or os.getenv("ROCKETCHAT_E2E_KEY_WAIT_DELAY", "1.25"))
+        self.e2e_background_wait_attempts = int(e2e_cfg.get("background_wait_attempts") or os.getenv("ROCKETCHAT_E2E_BACKGROUND_WAIT_ATTEMPTS", "48"))
+        self.e2e_background_wait_delay = float(e2e_cfg.get("background_wait_delay") or os.getenv("ROCKETCHAT_E2E_BACKGROUND_WAIT_DELAY", "2.5"))
 
         self._session: Any = None
         self._ddp = _DDPClient(self)
@@ -334,7 +343,16 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._e2e_armed_until: dict[str, float] = {}
         self._e2e_disable_after_reply: set[str] = set()
         self._e2e_persistent_rooms: set[str] = set()
+        self._e2e_pending_ready_tasks: dict[str, asyncio.Task] = {}
         self._dedup = MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
+        self._persistent_seen_path = Path(
+            extra.get("dedup_state_file")
+            or os.getenv("ROCKETCHAT_DEDUP_STATE_FILE", "")
+            or (_default_state_dir() / "rocketchat_seen_messages.json")
+        ).expanduser()
+        self._persistent_seen_ids: set[str] = set()
+        self._persistent_seen_order: list[str] = []
+        self._load_persistent_seen_messages()
 
     @property
     def name(self) -> str:
@@ -428,6 +446,10 @@ class RocketChatAdapter(BasePlatformAdapter):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        for task in list(getattr(self, "_e2e_pending_ready_tasks", {}).values()):
+            if task and not task.done():
+                task.cancel()
+        self._e2e_pending_ready_tasks.clear()
         await self._ddp.close()
         if self._session and not self._session.closed:
             await self._session.close()
@@ -473,7 +495,11 @@ class RocketChatAdapter(BasePlatformAdapter):
                 name=str(sub.get("name") or ""),
                 fname=str(sub.get("fname") or ""),
                 t=str(sub.get("t") or "c"),
-                encrypted=bool(sub.get("encrypted") or sub.get("E2EKey") or sub.get("E2ESuggestedKey")),
+                # Keep the room encryption flag separate from cached key material.
+                # A disabled room can retain E2EKey on the subscription; treating
+                # that as encrypted makes /e2e skip rooms.saveRoomSettings and then
+                # wait forever for a key we already have.
+                encrypted=bool(sub.get("encrypted")),
                 e2e_key=str(sub.get("E2EKey") or ""),
                 e2e_suggested_key=str(sub.get("E2ESuggestedKey") or ""),
                 e2e_key_id=str(sub.get("e2eKeyId") or sub.get("E2EKeyId") or ""),
@@ -516,6 +542,58 @@ class RocketChatAdapter(BasePlatformAdapter):
                     await self._handle_rc_message(msg)
             except Exception as exc:
                 logger.debug("Rocket.Chat: backfill failed for room %s: %s", room.rid, exc)
+
+    def _load_persistent_seen_messages(self) -> None:
+        """Load recently handled Rocket.Chat IDs so clean restarts do not replay backfill."""
+        self._persistent_seen_ids = set()
+        self._persistent_seen_order = []
+        path = getattr(self, "_persistent_seen_path", None)
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            ids = data.get("ids") if isinstance(data, dict) else data
+            if not isinstance(ids, list):
+                return
+            for msg_id in ids[-_PERSISTENT_DEDUP_MAX_IDS:]:
+                msg_id = str(msg_id or "").strip()
+                if msg_id and msg_id not in self._persistent_seen_ids:
+                    self._persistent_seen_ids.add(msg_id)
+                    self._persistent_seen_order.append(msg_id)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.debug("Rocket.Chat: persistent dedup state could not be loaded: %s", exc)
+
+    def _remember_persistent_seen_message(self, msg_id: str) -> bool:
+        """Return True for restart-persistent duplicates; otherwise record *msg_id*."""
+        msg_id = str(msg_id or "").strip()
+        if not msg_id:
+            return False
+        if not hasattr(self, "_persistent_seen_ids"):
+            self._persistent_seen_ids = set()
+            self._persistent_seen_order = []
+        if msg_id in self._persistent_seen_ids:
+            return True
+        self._persistent_seen_ids.add(msg_id)
+        self._persistent_seen_order.append(msg_id)
+        if len(self._persistent_seen_order) > _PERSISTENT_DEDUP_MAX_IDS:
+            self._persistent_seen_order = self._persistent_seen_order[-_PERSISTENT_DEDUP_MAX_IDS:]
+            self._persistent_seen_ids = set(self._persistent_seen_order)
+        path = getattr(self, "_persistent_seen_path", None)
+        if path:
+            try:
+                path = Path(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                tmp.write_text(
+                    json.dumps({"ids": self._persistent_seen_order, "updated_at": datetime.now(timezone.utc).isoformat()}),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, path)
+            except Exception as exc:
+                logger.debug("Rocket.Chat: persistent dedup state could not be saved: %s", exc)
+        return False
 
     async def _init_e2e(self) -> None:
         if not self.e2e_enabled:
@@ -576,8 +654,10 @@ class RocketChatAdapter(BasePlatformAdapter):
             logger.debug("Rocket.Chat: rooms.info refresh failed for %s: %s", room.rid, exc)
         return room
 
-    async def _wait_for_e2e_room_key(self, room: _RoomInfo, *, attempts: int = 8, delay: float = 1.0) -> bool:
-        for _ in range(max(1, attempts)):
+    async def _wait_for_e2e_room_key(self, room: _RoomInfo, *, attempts: int | None = None, delay: float | None = None) -> bool:
+        attempts = max(1, int(attempts if attempts is not None else getattr(self, "e2e_key_wait_attempts", 24)))
+        delay = float(delay if delay is not None else getattr(self, "e2e_key_wait_delay", 1.25))
+        for _ in range(attempts):
             await asyncio.sleep(delay)
             await self._refresh_subscriptions()
             room = await self._refresh_room_info(self._rooms.get(room.rid, room))
@@ -585,7 +665,49 @@ class RocketChatAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    async def _ensure_e2e_exchange_ready(self, room: _RoomInfo) -> tuple[bool, str]:
+    def _e2e_ready_message(self, *, persistent: bool) -> str:
+        if persistent:
+            return "E2E persistent mode ready. I will keep this DM encrypted until you send `e2e_off` as an encrypted message."
+        return "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+
+    def _arm_e2e_room(self, room: _RoomInfo, *, persistent: bool) -> None:
+        if persistent:
+            self._e2e_armed_until.pop(room.rid, None)
+            self._e2e_disable_after_reply.discard(room.rid)
+            self._e2e_persistent_rooms.add(room.rid)
+        else:
+            self._e2e_persistent_rooms.discard(room.rid)
+            self._e2e_armed_until[room.rid] = time.time() + 5 * 60
+
+    def _schedule_e2e_ready_watch(self, room: _RoomInfo, *, persistent: bool) -> None:
+        existing = getattr(self, "_e2e_pending_ready_tasks", {}).get(room.rid)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._e2e_ready_watch_loop(room, persistent=persistent))
+        self._e2e_pending_ready_tasks[room.rid] = task
+
+    async def _e2e_ready_watch_loop(self, room: _RoomInfo, *, persistent: bool) -> None:
+        try:
+            attempts = max(1, int(getattr(self, "e2e_background_wait_attempts", 48)))
+            delay = float(getattr(self, "e2e_background_wait_delay", 2.5))
+            if await self._wait_for_e2e_room_key(room, attempts=attempts, delay=delay):
+                room = self._rooms.get(room.rid, room)
+                self._arm_e2e_room(room, persistent=persistent)
+                await self._send_plain_text(room.rid, self._e2e_ready_message(persistent=persistent))
+                logger.info("Rocket.Chat: delayed E2E room key became ready for %s", room.rid)
+                return
+            await self._send_plain_text(
+                room.rid,
+                "E2E key sharing still has not completed. Please try `/e2e` again, or unlock/reopen this DM in your Rocket.Chat client so it can share the room key.",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Rocket.Chat: delayed E2E key wait failed for %s: %s", room.rid, exc)
+        finally:
+            getattr(self, "_e2e_pending_ready_tasks", {}).pop(room.rid, None)
+
+    async def _ensure_e2e_exchange_ready(self, room: _RoomInfo, *, wait_for_key: bool = True) -> tuple[bool, str]:
         if not self._e2e_supported_for_room(room):
             return False, "E2E is not initialized or this room type is not supported."
         try:
@@ -620,8 +742,12 @@ class RocketChatAdapter(BasePlatformAdapter):
                         logger.info("Rocket.Chat: requested E2E room key %s for %s", room.e2e_key_id, room.rid)
                     except Exception as exc:
                         logger.debug("Rocket.Chat: E2E room-key request failed for %s: %s", room.rid, exc)
+                if not wait_for_key:
+                    return False, "E2E key sharing has been requested; waiting for the room key in the background."
                 if await self._wait_for_e2e_room_key(room):
                     return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+            if not wait_for_key:
+                return False, "E2E key sharing has been requested; waiting for the room key in the background."
             if room.t == "d" and room.e2e_key_id and hasattr(self._e2e, "reset_room_key"):
                 try:
                     logger.info("Rocket.Chat: resetting stale/missing E2E room key for %s", room.rid)
@@ -1193,11 +1319,45 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._e2e_persistent_rooms.discard(room.rid)
         await self._set_room_encrypted(room, False)
 
-    async def _handle_encrypted_e2e_control(self, room: _RoomInfo, text: str) -> bool:
+    @staticmethod
+    def _parse_e2e_control(text: str) -> str:
+        """Return one of: once, on, off, status, usage, or empty string."""
         raw = (text or "").strip().lower()
-        if raw not in {"e2e off", "e2e cancel", "e2e stop", "e2e status", "e2e state"}:
+        if not raw:
+            return ""
+        # Deliberate non-slash controls avoid Rocket.Chat's slash-command parser
+        # and avoid accidental triggers from ordinary uses of the phrase "e2e".
+        non_slash = {
+            "e2e1": "once",
+            "e2e_on": "on",
+            "e2e_off": "off",
+            "e2e_status": "status",
+        }
+        if raw in non_slash:
+            return non_slash[raw]
+        # Backwards-compatible aliases. We keep accepting them, but docs should
+        # advertise the non-slash forms because Rocket.Chat can emit "unknown
+        # command"/"not allowed" UI messages for slash commands.
+        if raw == "/e2e":
+            return "once"
+        if raw.startswith("/e2e "):
+            subcmd = raw.split(maxsplit=1)[1].strip()
+            if subcmd in {"status", "state"}:
+                return "status"
+            if subcmd in {"cancel", "off", "stop"}:
+                return "off"
+            if subcmd in {"on", "persist", "persistent", "stay", "keep"}:
+                return "on"
+            if subcmd in {"", "next", "arm", "once", "one-shot", "oneshot"}:
+                return "once"
+            return "usage"
+        return ""
+
+    async def _handle_encrypted_e2e_control(self, room: _RoomInfo, text: str) -> bool:
+        command = self._parse_e2e_control(text)
+        if command not in {"off", "status"}:
             return False
-        if raw in {"e2e status", "e2e state"}:
+        if command == "status":
             await self._send_e2e_control_text(room, self._e2e_status_text(room))
             return True
         await self._send_e2e_control_text(room, "Turning E2E persistent mode off; normal DM mode restored.")
@@ -1208,37 +1368,38 @@ class RocketChatAdapter(BasePlatformAdapter):
         return True
 
     async def _handle_e2e_command(self, room: _RoomInfo, text: str) -> bool:
-        raw = (text or "").strip()
-        if raw != "/e2e" and not raw.startswith("/e2e "):
+        command = self._parse_e2e_control(text)
+        if not command:
             return False
-        parts = raw.split(maxsplit=1)
-        subcmd = (parts[1].strip().lower() if len(parts) > 1 else "next")
-        if subcmd in {"status", "state"}:
+        if command == "status":
             await self._send_plain_text(room.rid, self._e2e_status_text(room))
             return True
-        if subcmd in {"cancel", "off", "stop"}:
+        if command == "off":
             try:
                 await self._disable_e2e_mode(room)
             except Exception as exc:
                 logger.debug("Rocket.Chat: E2E cancel could not disable room %s: %s", room.rid, exc)
             await self._send_plain_text(room.rid, "E2E mode cancelled; normal DM mode restored.")
             return True
-        if subcmd in {"on", "persist", "persistent", "stay", "keep"}:
-            ok, message = await self._ensure_e2e_exchange_ready(room)
+        if command == "on":
+            ok, message = await self._ensure_e2e_exchange_ready(room, wait_for_key=False)
             if ok:
-                self._e2e_armed_until.pop(room.rid, None)
-                self._e2e_disable_after_reply.discard(room.rid)
-                self._e2e_persistent_rooms.add(room.rid)
-                message = "E2E persistent mode ready. I will keep this DM encrypted until you send `e2e off` as an encrypted message."
+                self._arm_e2e_room(room, persistent=True)
+                message = self._e2e_ready_message(persistent=True)
+            else:
+                self._schedule_e2e_ready_watch(room, persistent=True)
+                message = "E2E key sharing has been requested, but the room key is not available yet. I will keep checking and send a ready message here when it arrives; you should not need to send `e2e_on` again."
             await self._send_plain_text(room.rid, message)
             return True
-        if subcmd not in {"", "next", "arm", "once", "one-shot", "oneshot"}:
-            await self._send_plain_text(room.rid, "Usage: /e2e for one encrypted reply, /e2e on for persistent mode, /e2e status, or /e2e cancel. In persistent encrypted mode, send `e2e off` without a slash to return to plaintext.")
+        if command == "usage":
+            await self._send_plain_text(room.rid, "Usage: `e2e1` for one encrypted reply, `e2e_on` for persistent mode, `e2e_status`, or `e2e_off`. Slash aliases are accepted but may trigger Rocket.Chat parser warnings.")
             return True
-        ok, message = await self._ensure_e2e_exchange_ready(room)
+        ok, message = await self._ensure_e2e_exchange_ready(room, wait_for_key=False)
         if ok:
-            self._e2e_persistent_rooms.discard(room.rid)
-            self._e2e_armed_until[room.rid] = time.time() + 5 * 60
+            self._arm_e2e_room(room, persistent=False)
+        else:
+            self._schedule_e2e_ready_watch(room, persistent=False)
+            message = "E2E key sharing has been requested, but the room key is not available yet. I will keep checking and send a ready message here when it arrives; you should not need to send `e2e1` again."
         await self._send_plain_text(room.rid, message)
         return True
 
@@ -1249,7 +1410,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         rid = str(msg.get("rid") or "")
         if not msg_id or not rid:
             return
-        if self._dedup.is_duplicate(msg_id):
+        if self._dedup.is_duplicate(msg_id) or self._remember_persistent_seen_message(msg_id):
             return
         room = self._rooms.get(rid, _RoomInfo(rid=rid))
         msg_type = msg.get("t")
@@ -1268,7 +1429,10 @@ class RocketChatAdapter(BasePlatformAdapter):
                 self._rooms[rid] = room
                 try:
                     await self._refresh_subscriptions()
-                    room = self._rooms.get(rid, room)
+                    # subscriptions.get can lag or report encrypted=false even
+                    # after a room_e2e_enabled/control send. rooms.info is the
+                    # authoritative room setting needed before importing E2EKey.
+                    room = await self._refresh_room_info(self._rooms.get(rid, room))
                 except Exception as exc:
                     logger.debug("Rocket.Chat: E2E subscription refresh failed for %s: %s", rid, exc)
             decrypted = await self._decrypt_e2e_message(msg, room)

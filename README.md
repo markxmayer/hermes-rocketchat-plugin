@@ -39,8 +39,8 @@ rocketchat
 - Missed-message backfill on reconnect using recent room history endpoints.
 - Rocket.Chat-friendly text fallbacks for clarify/confirmation prompts where buttons are unavailable.
 - Optional DM-only Rocket.Chat E2EE support: decrypt incoming encrypted DM text and encrypt outgoing DM replies. If the Hermes user has no E2E identity yet, the plugin can generate its own local recovery password and publish a new keypair to Rocket.Chat.
-- Plugin-local `/e2e` control command for one-shot encrypted DM exchanges using Rocket.Chat's official room-key/suggested-key flow.
-- Persistent DM E2EE mode: `/e2e on` keeps the DM encrypted across turns until the user sends `e2e off` as an encrypted message. Also supports `e2e status`, `e2e cancel`, and stale-key/key-sharing recovery helpers.
+- Plugin-local `e2e1` control command for one-shot encrypted DM exchanges using Rocket.Chat's official room-key/suggested-key flow. Legacy slash aliases are accepted but not recommended because Rocket.Chat may show parser warnings.
+- Persistent DM E2EE mode: `e2e_on` keeps the DM encrypted across turns until the user sends `e2e_off` as an encrypted message. Also supports `e2e_status` and stale-key/key-sharing recovery helpers.
 - Test coverage for transport, upload, backfill, prompt fallback, and deletion behavior.
 
 ## Files
@@ -158,7 +158,7 @@ python -m pytest ~/.hermes/plugins/rocketchat/test_adapter.py -q -o 'addopts='
 Expected current result:
 
 ```text
-34 passed
+41 passed
 ```
 
 ## Live smoke-test checklist
@@ -170,14 +170,14 @@ Expected current result:
 - Confirm a long reply or thread reply preserves `tmid` behavior according to configured reply mode.
 - Restart the gateway, send a message during downtime, then confirm recent-message backfill catches it after reconnect if within the backfill window.
 - Test `/approve`, `/always`, and `/cancel` style confirmation text in Rocket.Chat if using command approval flows.
-- For one-shot E2EE DMs: enable plugin E2E, send `/e2e` in the DM, wait for the plaintext “E2E ready” control reply, then send one encrypted message. Hermes should decrypt it, answer encrypted, and then disable room E2E again.
-- For persistent E2EE DMs: send `/e2e on`, wait for “E2E persistent mode ready”, then continue chatting. To leave persistent mode, send `e2e off` as a normal encrypted message, not `/e2e off` — Rocket.Chat blocks slash commands in encrypted rooms. Use `/e2e status` before encryption or encrypted `e2e status` during persistent mode to inspect helper/key state.
+- For one-shot E2EE DMs: enable plugin E2E, send `e2e1` in the DM, wait for the plaintext “E2E ready” control reply, then send one encrypted message. Hermes should decrypt it, answer encrypted, and then disable room E2E again.
+- For persistent E2EE DMs: send `e2e_on`, wait for “E2E persistent mode ready”, then continue chatting. To leave persistent mode, send encrypted `e2e_off`. Use `e2e_status` before encryption or encrypted `e2e_status` during persistent mode to inspect helper/key state. Legacy `/e2e` slash aliases are accepted but may trigger Rocket.Chat “unknown command”/“not allowed” UI messages.
 
 ## Notes and caveats
 
 - This is a user plugin, not an upstream Hermes core platform.
 - It uses REST for stable operations and DDP only for inbound realtime delivery.
-- E2EE is deliberately conservative: DM/private-room text crypto is implemented, but the adapter defaults to DM-only and does not support encrypted media/file upload. Gateway-side E2EE initialization can generate and manage Hermes's own local recovery password/keypair when the Hermes Rocket.Chat user has no existing E2E identity. The plugin-local `/e2e` and `/e2e on` commands are plaintext control messages only; do not put sensitive content in the slash command itself. Send sensitive content only after the ready prompt. While a room is encrypted, disable persistent mode with encrypted plain text `e2e off`, because Rocket.Chat blocks slash commands in encrypted rooms.
+- E2EE is deliberately conservative: DM/private-room text crypto is implemented, but the adapter defaults to DM-only and does not support encrypted media/file upload. Gateway-side E2EE initialization can generate and manage Hermes's own local recovery password/keypair when the Hermes Rocket.Chat user has no existing E2E identity. Use deliberate non-slash controls: `e2e1` for one-shot, `e2e_on` for persistent mode, `e2e_off` to disable, and `e2e_status` for diagnostics. Do not put sensitive content in control messages; send sensitive content only after the ready prompt. Slash aliases are accepted for compatibility but are not recommended because Rocket.Chat's slash-command parser may show parser warnings or block them while encrypted.
 - Rocket.Chat's DDP/realtime APIs are marked deprecated in current docs, but still remain useful for bot-style realtime inbound messages unless replacing with polling, webhooks, or a Rocket.Chat App.
 - Keep secrets in `.env` or config; never commit them into this plugin directory.
 

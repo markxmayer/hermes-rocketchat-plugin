@@ -40,10 +40,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-to be filled by packager; latest feature baseline is 49759d7 feat: add persistent Rocket.Chat E2E mode
+v0.3.0 tag (`feat: use deliberate Rocket.Chat E2E controls`)
 ```
 
-Plugin version: `0.2.1`
+Plugin version: `0.3.0`
 
 ## Current capabilities
 
@@ -70,8 +70,8 @@ Plugin version: `0.2.1`
 - Recent-message backfill on reconnect through `channels.history`, `groups.history`, and `im.history`.
 - Rocket.Chat-friendly text fallbacks for clarify and slash-confirm flows.
 - Optional DM-only Rocket.Chat E2EE support.
-- One-shot encrypted DM exchanges with `/e2e`.
-- Persistent encrypted DM mode with `/e2e on`; disable while encrypted by sending `e2e off` as plain text inside the encrypted room. Rocket.Chat blocks slash commands while the room is encrypted.
+- One-shot encrypted DM exchanges with `e2e1`.
+- Persistent encrypted DM mode with `e2e_on`; disable while encrypted by sending `e2e_off` as encrypted text. `e2e_status` reports helper/key state. Legacy `/e2e` slash aliases remain accepted but are not recommended because Rocket.Chat may display parser warnings or block slash commands while encrypted.
 - E2E key-sharing helpers for existing rooms, stale-key rotation fallback, and bot key-share queueing without rotating the bot RSA identity.
 
 ## Verification run
@@ -81,13 +81,13 @@ The current package was verified with:
 ```bash
 cd /Users/mark/.hermes/plugins/rocketchat
 python -m py_compile adapter.py
-python -m pytest test_adapter.py -q -o 'addopts='
+python -m pytest test_adapter.py -q
 ```
 
 Expected result:
 
 ```text
-34 passed
+41 passed
 ```
 
 ## Configuration
@@ -164,8 +164,8 @@ Restarting the gateway is required for plugin code changes to load.
 5. Test a remote image/GIF URL flow and confirm native upload instead of bare URL output.
 6. Confirm command approvals render usable `/approve`, `/always`, `/cancel` text prompts.
 7. Restart gateway and test whether messages sent during a short downtime are recovered by backfill.
-8. For one-shot E2E: send `/e2e`, wait for ready, send one encrypted message, and confirm Hermes answers encrypted then returns the DM to plaintext.
-9. For persistent E2E: send `/e2e on`, wait for persistent-ready, chat for multiple turns, then send encrypted `e2e off` and confirm the DM returns to plaintext.
+8. For one-shot E2E: send `e2e1`, wait for ready, send one encrypted message, and confirm Hermes answers encrypted then returns the DM to plaintext.
+9. For persistent E2E: send `e2e_on`, wait for persistent-ready, chat for multiple turns, then send encrypted `e2e_off` and confirm the DM returns to plaintext.
 
 ## Protocol notes
 
