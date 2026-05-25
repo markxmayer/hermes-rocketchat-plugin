@@ -348,6 +348,7 @@ class RocketChatE2E:
         self.force_unreadable_identity = force_unreadable_identity
         self.public_key_json = ""
         self.private_key_json = ""
+        self.encrypted_private_key_json = ""
         self.private_key: Optional[rsa.RSAPrivateKey] = None
         self.rooms: dict[str, RoomE2EState] = {}
 
@@ -377,6 +378,7 @@ class RocketChatE2E:
                 )
                 self.private_key_json = private_key
         self.public_key_json = public_key
+        self.encrypted_private_key_json = encrypted_private_key
         self.private_key = private_key_from_jwk(json.loads(self.private_key_json))
         if self._ddp_call:
             try:
@@ -464,6 +466,22 @@ class RocketChatE2E:
 
     async def request_subscription_keys(self) -> bool:
         await self._method_call("e2e.requestSubscriptionKeys", [])
+        return True
+
+    async def queue_me_for_room_keys(self) -> bool:
+        """Ask Rocket.Chat to add this user's encrypted rooms without E2EKey to the key-sharing queue.
+
+        Re-posting the same user E2E identity with force=true is the official code
+        path that calls Rooms.addUserIdToE2EEQueueByRoomIds(...) for encrypted
+        subscribed rooms where this user lacks an E2EKey. This does not rotate the
+        bot identity because it sends the already-loaded public/private key pair.
+        """
+        if not self.public_key_json or not self.encrypted_private_key_json:
+            return False
+        await self._rest_post(
+            "/api/v1/e2e.setUserPublicAndPrivateKeys",
+            {"public_key": self.public_key_json, "private_key": self.encrypted_private_key_json, "force": True},
+        )
         return True
 
     async def request_room_key(self, rid: str, key_id: str) -> bool:

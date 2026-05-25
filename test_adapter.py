@@ -455,6 +455,32 @@ def test_e2e_requests_room_key_via_notify_room_users_stream():
     assert message["params"] == ["ROOM1/e2ekeyRequest", "ROOM1", "kid1"]
 
 
+def test_e2e_queues_self_for_room_key_sharing_without_rotating_identity():
+    e2e = adapter._load_e2e_module()
+    posts = []
+
+    async def fake_get(path, *, params=None):
+        return {"success": True}
+
+    async def fake_post(path, payload):
+        posts.append((path, payload))
+        return {"success": True}
+
+    async def run():
+        helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
+        helper.public_key_json = "public-json"
+        helper.encrypted_private_key_json = "encrypted-private-json"
+        assert await helper.queue_me_for_room_keys() is True
+
+    asyncio.run(run())
+
+    assert posts == [("/api/v1/e2e.setUserPublicAndPrivateKeys", {
+        "public_key": "public-json",
+        "private_key": "encrypted-private-json",
+        "force": True,
+    })]
+
+
 def test_e2e_resets_existing_room_key_with_official_endpoint():
     e2e = adapter._load_e2e_module()
     posts = []

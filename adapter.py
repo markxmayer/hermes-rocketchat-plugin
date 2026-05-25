@@ -607,6 +607,12 @@ class RocketChatAdapter(BasePlatformAdapter):
                     await self._e2e.request_subscription_keys()
                 except Exception as exc:
                     logger.debug("Rocket.Chat: E2E subscription-key request failed for %s: %s", room.rid, exc)
+                if self._e2e and hasattr(self._e2e, "queue_me_for_room_keys"):
+                    try:
+                        if await self._e2e.queue_me_for_room_keys():
+                            logger.info("Rocket.Chat: queued self for E2E room-key sharing in encrypted rooms")
+                    except Exception as exc:
+                        logger.debug("Rocket.Chat: E2E self queue request failed for %s: %s", room.rid, exc)
                 if room.e2e_key_id and hasattr(self._e2e, "request_room_key"):
                     try:
                         await self._e2e.request_room_key(room.rid, room.e2e_key_id)
