@@ -40,10 +40,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-v0.3.0 tag (`feat: use deliberate Rocket.Chat E2E controls`)
+v0.3.1 tag (`fix: accept E2EE image attachments with generic MIME`)
 ```
 
-Plugin version: `0.3.0`
+Plugin version: `0.3.1`
 
 ## Current capabilities
 
@@ -70,6 +70,7 @@ Plugin version: `0.3.0`
 - Recent-message backfill on reconnect through `channels.history`, `groups.history`, and `im.history`.
 - Rocket.Chat-friendly text fallbacks for clarify and slash-confirm flows.
 - Optional DM-only Rocket.Chat E2EE support.
+- Inbound E2EE DM image attachments are accepted even when Rocket.Chat serves the file as generic `application/octet-stream`; the adapter verifies image magic bytes before caching for Hermes vision.
 - One-shot encrypted DM exchanges with `e2e1`.
 - Persistent encrypted DM mode with `e2e_on`; disable while encrypted by sending `e2e_off` as encrypted text. `e2e_status` reports helper/key state. Legacy `/e2e` slash aliases remain accepted but are not recommended because Rocket.Chat may display parser warnings or block slash commands while encrypted.
 - E2E key-sharing helpers for existing rooms, stale-key rotation fallback, and bot key-share queueing without rotating the bot RSA identity.

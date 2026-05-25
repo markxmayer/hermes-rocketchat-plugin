@@ -120,6 +120,54 @@ def test_extract_inbound_image_prefers_original_file_link(monkeypatch):
     assert downloads == [("https://chat.example.com/file-upload/file123/screen.png", "screen.png", "image/png")]
 
 
+def test_sniff_image_mime_detects_common_images():
+    assert adapter._sniff_image_mime(b"\x89PNG\r\n\x1a\nrest") == "image/png"
+    assert adapter._sniff_image_mime(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
+    assert adapter._sniff_image_mime(b"GIF89arest") == "image/gif"
+    assert adapter._sniff_image_mime(b"RIFFxxxxWEBPrest") == "image/webp"
+    assert adapter._sniff_image_mime(b"not an image") == ""
+
+
+def test_download_inbound_media_accepts_e2e_octet_stream_with_image_magic(monkeypatch):
+    rc = _bare_adapter()
+    png_body = b"\x89PNG\r\n\x1a\nfake png payload"
+    cached = []
+
+    class FakeResponse:
+        status = 200
+        headers = {"Content-Type": "application/octet-stream"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def read(self):
+            return png_body
+
+    class FakeSession:
+        def get(self, url, headers=None, timeout=None):
+            return FakeResponse()
+
+    def fake_cache_image_from_bytes(body, ext):
+        cached.append((body, ext))
+        return "/tmp/cached-e2e.png"
+
+    rc._session = FakeSession()
+    monkeypatch.setattr(adapter, "cache_image_from_bytes", fake_cache_image_from_bytes)
+
+    path, mime = asyncio.run(rc._download_inbound_media(
+        "https://chat.example.com/file-upload/file123/photo.png",
+        "photo.png",
+        "image/png",
+    ))
+
+    assert path == "/tmp/cached-e2e.png"
+    assert mime == "image/png"
+    assert cached == [(png_body, ".png")]
+
+
 def test_handle_rc_message_emits_photo_event_with_cached_image(monkeypatch):
     rc = _bare_adapter()
     events = []

@@ -67,6 +67,23 @@ _STALE_MESSAGE_AGE_SEC = 5 * 60
 _MAX_INBOUND_MEDIA_BYTES = int(os.getenv("ROCKETCHAT_MAX_INBOUND_MEDIA_BYTES", str(25 * 1024 * 1024)))
 _IMAGE_MIME_PREFIX = "image/"
 _PERSISTENT_DEDUP_MAX_IDS = 2000
+_IMAGE_MAGIC_MIME_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),  # Confirmed below by WEBP marker at offset 8.
+)
+
+
+def _sniff_image_mime(body: bytes) -> str:
+    """Return an image MIME type from file magic, or an empty string."""
+    for magic, mime in _IMAGE_MAGIC_MIME_PREFIXES:
+        if body.startswith(magic):
+            if mime == "image/webp" and body[8:12] != b"WEBP":
+                continue
+            return mime
+    return ""
 
 
 def _default_state_dir() -> Path:
@@ -1280,8 +1297,18 @@ class RocketChatAdapter(BasePlatformAdapter):
             if len(body) > _MAX_INBOUND_MEDIA_BYTES:
                 raise RuntimeError(f"media file too large: {len(body)} bytes")
             response_type = str(resp.headers.get("Content-Type") or content_type or "").split(";", 1)[0].strip().lower()
+            sniffed_type = _sniff_image_mime(body)
             if not response_type.startswith(_IMAGE_MIME_PREFIX):
-                raise RuntimeError(f"unsupported inbound media type: {response_type or 'unknown'}")
+                # Rocket.Chat E2EE file downloads can come back as generic
+                # application/octet-stream even when the attachment metadata and
+                # bytes are a real image.  Trust image magic bytes over the
+                # generic response header, but keep rejecting non-image blobs.
+                if sniffed_type and response_type in {"", "application/octet-stream", "binary/octet-stream"}:
+                    response_type = sniffed_type
+                else:
+                    raise RuntimeError(f"unsupported inbound media type: {response_type or 'unknown'}")
+            elif sniffed_type:
+                response_type = sniffed_type
             ext = mimetypes.guess_extension(response_type) or Path(filename).suffix or ".jpg"
             if ext == ".jpe":
                 ext = ".jpg"

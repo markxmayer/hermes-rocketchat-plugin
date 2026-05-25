@@ -39,6 +39,7 @@ rocketchat
 - Missed-message backfill on reconnect using recent room history endpoints.
 - Rocket.Chat-friendly text fallbacks for clarify/confirmation prompts where buttons are unavailable.
 - Optional DM-only Rocket.Chat E2EE support: decrypt incoming encrypted DM text and encrypt outgoing DM replies. If the Hermes user has no E2E identity yet, the plugin can generate its own local recovery password and publish a new keypair to Rocket.Chat.
+- Inbound image attachments in E2EE DMs are accepted when Rocket.Chat serves them as generic `application/octet-stream`; the adapter verifies image magic bytes before caching them for Hermes vision.
 - Plugin-local `e2e1` control command for one-shot encrypted DM exchanges using Rocket.Chat's official room-key/suggested-key flow. Legacy slash aliases are accepted but not recommended because Rocket.Chat may show parser warnings.
 - Persistent DM E2EE mode: `e2e_on` keeps the DM encrypted across turns until the user sends `e2e_off` as an encrypted message. Also supports `e2e_status` and stale-key/key-sharing recovery helpers.
 - Test coverage for transport, upload, backfill, prompt fallback, and deletion behavior.
@@ -177,7 +178,7 @@ Expected current result:
 
 - This is a user plugin, not an upstream Hermes core platform.
 - It uses REST for stable operations and DDP only for inbound realtime delivery.
-- E2EE is deliberately conservative: DM/private-room text crypto is implemented, but the adapter defaults to DM-only and does not support encrypted media/file upload. Gateway-side E2EE initialization can generate and manage Hermes's own local recovery password/keypair when the Hermes Rocket.Chat user has no existing E2E identity. Use deliberate non-slash controls: `e2e1` for one-shot, `e2e_on` for persistent mode, `e2e_off` to disable, and `e2e_status` for diagnostics. Do not put sensitive content in control messages; send sensitive content only after the ready prompt. Slash aliases are accepted for compatibility but are not recommended because Rocket.Chat's slash-command parser may show parser warnings or block them while encrypted.
+- E2EE is deliberately conservative: DM/private-room text crypto is implemented, inbound encrypted image attachments are accepted only after byte-level image verification, and the adapter defaults to DM-only. Encrypted media/file upload from Hermes is not implemented yet. Gateway-side E2EE initialization can generate and manage Hermes's own local recovery password/keypair when the Hermes Rocket.Chat user has no existing E2E identity. Use deliberate non-slash controls: `e2e1` for one-shot, `e2e_on` for persistent mode, `e2e_off` to disable, and `e2e_status` for diagnostics. Do not put sensitive content in control messages; send sensitive content only after the ready prompt. Slash aliases are accepted for compatibility but are not recommended because Rocket.Chat's slash-command parser may show parser warnings or block them while encrypted.
 - Rocket.Chat's DDP/realtime APIs are marked deprecated in current docs, but still remain useful for bot-style realtime inbound messages unless replacing with polling, webhooks, or a Rocket.Chat App.
 - Keep secrets in `.env` or config; never commit them into this plugin directory.
 
