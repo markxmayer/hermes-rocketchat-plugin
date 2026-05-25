@@ -560,6 +560,30 @@ class RocketChatAdapter(BasePlatformAdapter):
         room.encrypted = encrypted
         self._rooms[room.rid] = room
 
+    async def _refresh_room_info(self, room: _RoomInfo) -> _RoomInfo:
+        try:
+            data = await self._api_get("/api/v1/rooms.info", params={"roomId": room.rid})
+            info = data.get("room") or {}
+            if isinstance(info, dict):
+                if "encrypted" in info:
+                    room.encrypted = bool(info.get("encrypted"))
+                key_id = str(info.get("e2eKeyId") or info.get("E2EKeyId") or "")
+                if key_id:
+                    room.e2e_key_id = key_id
+                self._rooms[room.rid] = room
+        except Exception as exc:
+            logger.debug("Rocket.Chat: rooms.info refresh failed for %s: %s", room.rid, exc)
+        return room
+
+    async def _wait_for_e2e_room_key(self, room: _RoomInfo, *, attempts: int = 8, delay: float = 1.0) -> bool:
+        for _ in range(max(1, attempts)):
+            await asyncio.sleep(delay)
+            await self._refresh_subscriptions()
+            room = await self._refresh_room_info(self._rooms.get(room.rid, room))
+            if await self._prepare_e2e_room(room):
+                return True
+        return False
+
     async def _ensure_e2e_exchange_ready(self, room: _RoomInfo) -> tuple[bool, str]:
         if not self._e2e_supported_for_room(room):
             return False, "E2E is not initialized or this room type is not supported."
@@ -567,7 +591,9 @@ class RocketChatAdapter(BasePlatformAdapter):
             if not room.encrypted:
                 await self._set_room_encrypted(room, True)
                 await self._refresh_subscriptions()
-                room = self._rooms.get(room.rid, room)
+                room = await self._refresh_room_info(self._rooms.get(room.rid, room))
+            else:
+                room = await self._refresh_room_info(room)
             if await self._prepare_e2e_room(room):
                 try:
                     shared = await self._e2e.distribute_room_key(room.rid)
@@ -581,9 +607,13 @@ class RocketChatAdapter(BasePlatformAdapter):
                     await self._e2e.request_subscription_keys()
                 except Exception as exc:
                     logger.debug("Rocket.Chat: E2E subscription-key request failed for %s: %s", room.rid, exc)
-                await self._refresh_subscriptions()
-                room = self._rooms.get(room.rid, room)
-                if await self._prepare_e2e_room(room):
+                if room.e2e_key_id and hasattr(self._e2e, "request_room_key"):
+                    try:
+                        await self._e2e.request_room_key(room.rid, room.e2e_key_id)
+                        logger.info("Rocket.Chat: requested E2E room key %s for %s", room.e2e_key_id, room.rid)
+                    except Exception as exc:
+                        logger.debug("Rocket.Chat: E2E room-key request failed for %s: %s", room.rid, exc)
+                if await self._wait_for_e2e_room_key(room):
                     return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
             if room.t == "d" and not room.e2e_key_id:
                 try:

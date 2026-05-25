@@ -447,6 +447,12 @@ class RocketChatE2E:
         await self._method_call("e2e.requestSubscriptionKeys", [])
         return True
 
+    async def request_room_key(self, rid: str, key_id: str) -> bool:
+        if not key_id:
+            return False
+        await self._method_call("stream-notify-room-users", [f"{rid}/e2ekeyRequest", rid, key_id])
+        return True
+
     async def distribute_room_key(self, rid: str) -> int:
         """Share our cached room key using Rocket.Chat's official suggested-key flow."""
         state = self.rooms.get(rid)
