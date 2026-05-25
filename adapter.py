@@ -331,6 +331,8 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._rooms: dict[str, _RoomInfo] = {}
         self._e2e: Any = None
         self._e2e_module: Any = None
+        self._e2e_armed_until: dict[str, float] = {}
+        self._e2e_disable_after_reply: set[str] = set()
         self._dedup = MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
 
     @property
@@ -539,12 +541,56 @@ class RocketChatAdapter(BasePlatformAdapter):
             self._e2e = None
             logger.error("Rocket.Chat: E2E initialization failed: %s", exc)
 
-    def _e2e_allowed_for_room(self, room: _RoomInfo) -> bool:
-        if not self.e2e_enabled or not self._e2e or not room.encrypted:
+    def _e2e_supported_for_room(self, room: _RoomInfo) -> bool:
+        if not self.e2e_enabled or not self._e2e:
             return False
         if self.e2e_dm_only and room.t != "d":
             return False
         return room.t in {"d", "p"}
+
+    def _e2e_allowed_for_room(self, room: _RoomInfo) -> bool:
+        return self._e2e_supported_for_room(room) and bool(room.encrypted)
+
+    async def _set_room_encrypted(self, room: _RoomInfo, encrypted: bool) -> None:
+        if room.encrypted is encrypted:
+            return
+        await self._api_post("/api/v1/rooms.saveRoomSettings", {"rid": room.rid, "encrypted": encrypted})
+        room.encrypted = encrypted
+        self._rooms[room.rid] = room
+
+    async def _ensure_e2e_exchange_ready(self, room: _RoomInfo) -> tuple[bool, str]:
+        if not self._e2e_supported_for_room(room):
+            return False, "E2E is not initialized or this room type is not supported."
+        try:
+            if not room.encrypted:
+                await self._set_room_encrypted(room, True)
+                await self._refresh_subscriptions()
+                room = self._rooms.get(room.rid, room)
+            if await self._prepare_e2e_room(room):
+                try:
+                    shared = await self._e2e.distribute_room_key(room.rid)
+                    if shared:
+                        logger.info("Rocket.Chat: shared E2E room key for %s with %d participant(s)", room.rid, shared)
+                except Exception as exc:
+                    logger.debug("Rocket.Chat: E2E key distribution failed for %s: %s", room.rid, exc)
+                return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+            if room.t == "d" and not room.e2e_key_id:
+                await self._e2e.create_room_key(room.rid)
+                await self._refresh_subscriptions()
+                return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+            if self._e2e and hasattr(self._e2e, "request_subscription_keys"):
+                try:
+                    await self._e2e.request_subscription_keys()
+                except Exception:
+                    pass
+                await self._refresh_subscriptions()
+                room = self._rooms.get(room.rid, room)
+                if await self._prepare_e2e_room(room):
+                    return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+            return False, "E2E was enabled, but I do not have the room key yet. Leave E2E enabled briefly or send another encrypted message so your client can share the key."
+        except Exception as exc:
+            logger.warning("Rocket.Chat: failed to prepare one-shot E2E exchange for %s: %s", room.rid, exc)
+            return False, f"I could not prepare E2E for this room: {exc}"
 
     async def _prepare_e2e_room(self, room: _RoomInfo) -> bool:
         if not self._e2e_allowed_for_room(room):
@@ -572,6 +618,15 @@ class RocketChatAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Rocket.Chat: encrypted message in %s could not be decrypted: %s", room.rid, exc)
             return None
+
+    async def _send_plain_text(self, chat_id: str, content: str) -> SendResult:
+        try:
+            data = await self._api_post("/api/v1/chat.postMessage", {"roomId": str(chat_id), "text": content})
+            msg = data.get("message") or {}
+            return SendResult(success=True, message_id=str(msg.get("_id") or data.get("_id") or "") or None)
+        except Exception as exc:
+            logger.error("Rocket.Chat: plaintext control send failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _send_e2e_chunk(self, room: _RoomInfo, chunk: str) -> dict[str, Any]:
         if not await self._prepare_e2e_room(room):
@@ -607,6 +662,13 @@ class RocketChatAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.error("Rocket.Chat: send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
+        if room and room.rid in self._e2e_disable_after_reply:
+            self._e2e_disable_after_reply.discard(room.rid)
+            self._e2e_armed_until.pop(room.rid, None)
+            try:
+                await self._set_room_encrypted(room, False)
+            except Exception as exc:
+                logger.warning("Rocket.Chat: failed to disable one-shot E2E room %s after reply: %s", room.rid, exc)
         return SendResult(success=True, message_id=str(last_id) if last_id else None)
 
     def _should_thread(self, text: str) -> bool:
@@ -1039,6 +1101,49 @@ class RocketChatAdapter(BasePlatformAdapter):
                 ext = ".jpg"
             return cache_image_from_bytes(body, ext), response_type
 
+    def _e2e_status_text(self, room: _RoomInfo) -> str:
+        helper_ready = bool(self._e2e)
+        have_key = bool(helper_ready and getattr(self._e2e, "have_room", lambda _rid: False)(room.rid))
+        armed_until = self._e2e_armed_until.get(room.rid, 0)
+        armed = armed_until > time.time()
+        return "\n".join([
+            "E2E status:",
+            f"- helper: {'ready' if helper_ready else 'not initialized'}",
+            f"- room type: {room.chat_type}",
+            f"- room encrypted: {bool(room.encrypted)}",
+            f"- room key id: {'present' if room.e2e_key_id else 'missing'}",
+            f"- my room key: {'present' if have_key else 'missing'}",
+            f"- suggested key: {'present' if room.e2e_suggested_key else 'missing'}",
+            f"- one-shot exchange: {'armed' if armed else 'not armed'}",
+        ])
+
+    async def _handle_e2e_command(self, room: _RoomInfo, text: str) -> bool:
+        raw = (text or "").strip()
+        if raw != "/e2e" and not raw.startswith("/e2e "):
+            return False
+        parts = raw.split(maxsplit=1)
+        subcmd = (parts[1].strip().lower() if len(parts) > 1 else "next")
+        if subcmd in {"status", "state"}:
+            await self._send_plain_text(room.rid, self._e2e_status_text(room))
+            return True
+        if subcmd in {"cancel", "off", "stop"}:
+            self._e2e_armed_until.pop(room.rid, None)
+            self._e2e_disable_after_reply.discard(room.rid)
+            try:
+                await self._set_room_encrypted(room, False)
+            except Exception as exc:
+                logger.debug("Rocket.Chat: E2E cancel could not disable room %s: %s", room.rid, exc)
+            await self._send_plain_text(room.rid, "E2E one-shot exchange cancelled; normal DM mode restored.")
+            return True
+        if subcmd not in {"", "next", "arm", "on"}:
+            await self._send_plain_text(room.rid, "Usage: /e2e, /e2e status, or /e2e cancel. Send sensitive content only after /e2e says it is ready.")
+            return True
+        ok, message = await self._ensure_e2e_exchange_ready(room)
+        if ok:
+            self._e2e_armed_until[room.rid] = time.time() + 5 * 60
+        await self._send_plain_text(room.rid, message)
+        return True
+
     async def _handle_rc_message(self, msg: dict[str, Any]) -> None:
         if not isinstance(msg, dict):
             return
@@ -1086,6 +1191,10 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         room = self._rooms.get(rid, room)
         text = str(msg.get("msg") or "")
+        if await self._handle_e2e_command(room, text):
+            return
+        if msg_type == "e2e" and self._e2e_armed_until.get(rid, 0) > time.time():
+            self._e2e_disable_after_reply.add(rid)
         if not self._should_process_room_message(rid, msg, text, room):
             return
         clean_text = _strip_bot_mention(text, self._bot_username) if room.chat_type != "dm" else text

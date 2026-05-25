@@ -409,14 +409,65 @@ class RocketChatE2E:
 
     async def create_room_key(self, rid: str) -> RoomE2EState:
         kid, session_key_json, session_key = generate_session_key()
-        await self._rest_post("/api/v1/method.call/e2e.setRoomKeyID", {"message": _json_dumps_compact({"msg": "method", "method": "e2e.setRoomKeyID", "params": [rid, kid]})})
+        if self._ddp_call:
+            await self._ddp_call("e2e.setRoomKeyID", [rid, kid])
+        else:
+            await self._rest_post(
+                "/api/v1/method.call/e2e.setRoomKeyID",
+                {"message": _json_dumps_compact({"msg": "method", "method": "e2e.setRoomKeyID", "params": [rid, kid]})},
+            )
         if not self.public_key_json:
             raise RuntimeError("E2E public key not loaded")
         my_key = encrypt_session_key_for_public(session_key_json, kid, self.public_key_json)
         await self._rest_post("/api/v1/e2e.updateGroupKey", {"rid": rid, "uid": self.user_id, "key": my_key})
         state = RoomE2EState(rid=rid, kid=kid, session_key_json=session_key_json, session_key=session_key)
         self.rooms[rid] = state
+        await self.distribute_room_key(rid)
         return state
+
+    async def request_subscription_keys(self) -> bool:
+        if not self._ddp_call:
+            return False
+        await self._ddp_call("e2e.requestSubscriptionKeys", [])
+        return True
+
+    async def distribute_room_key(self, rid: str) -> int:
+        """Share our cached room key using Rocket.Chat's official suggested-key flow."""
+        state = self.rooms.get(rid)
+        if not state:
+            return 0
+        users: list[dict[str, Any]] = []
+        if self._ddp_call:
+            result = await self._ddp_call("e2e.getUsersOfRoomWithoutKey", [rid])
+            if isinstance(result, dict):
+                users = [u for u in result.get("users") or [] if isinstance(u, dict)]
+        else:
+            data = await self._rest_post(
+                "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey",
+                {"message": _json_dumps_compact({"msg": "method", "method": "e2e.getUsersOfRoomWithoutKey", "params": [rid]})},
+            )
+            message = data.get("message") if isinstance(data, dict) else None
+            if isinstance(message, str):
+                try:
+                    parsed = json.loads(message)
+                    users = [u for u in (parsed.get("result") or {}).get("users") or [] if isinstance(u, dict)]
+                except Exception:
+                    users = []
+        suggestions = []
+        for user in users:
+            uid = str(user.get("_id") or "")
+            public_key = str(((user.get("e2e") or {}) if isinstance(user.get("e2e"), dict) else {}).get("public_key") or "")
+            if not uid or uid == self.user_id or not public_key:
+                continue
+            try:
+                key = encrypt_session_key_for_public(state.session_key_json, state.kid, public_key)
+            except Exception:
+                continue
+            suggestions.append({"_id": uid, "key": key})
+        if not suggestions:
+            return 0
+        await self._rest_post("/api/v1/e2e.provideUsersSuggestedGroupKeys", {"usersSuggestedGroupKeys": {rid: suggestions}})
+        return len(suggestions)
 
     def decrypt_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         rid = str(msg.get("rid") or "")
