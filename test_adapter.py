@@ -77,6 +77,10 @@ def _bare_adapter():
     rc.mark_as_read = False
     rc.require_mention = False
     rc.rooms_config = {}
+    rc.e2e_enabled = False
+    rc.e2e_dm_only = True
+    rc.e2e_auto_create_dm_key = False
+    rc._e2e = None
     return rc
 
 
@@ -310,3 +314,97 @@ def test_send_clarify_and_slash_confirm_use_text_fallback(monkeypatch):
     assert clarify.success is True and confirm.success is True
     assert "Pick one" in sent[0][1] and "1. A" in sent[0][1] and "2. B" in sent[0][1]
     assert "Reload MCP?" in sent[1][1] and "/approve" in sent[1][1] and "/cancel" in sent[1][1]
+
+
+
+def test_e2e_helper_encrypts_and_decrypts_dm_message_roundtrip():
+    e2e = adapter._load_e2e_module()
+    public_key, private_key = e2e.generate_rsa_jwks()
+    wrapped = e2e.encode_private_key(private_key, "test password", "bot-user-id")
+    decoded = e2e.decode_private_key(wrapped, "test password", "bot-user-id")
+    assert adapter.json.loads(decoded)["kty"] == "RSA"
+
+    private = e2e.private_key_from_jwk(adapter.json.loads(decoded))
+    kid, session_key_json, session_key = e2e.generate_session_key()
+    group_key = e2e.encrypt_session_key_for_public(session_key_json, kid, public_key)
+    parsed_kid, parsed_session_json, parsed_session_key = e2e.decrypt_session_key(group_key, private)
+    assert parsed_kid == kid
+    assert parsed_session_json == session_key_json
+    assert parsed_session_key == session_key
+
+    content = e2e.encrypt_message_content("secret hello", session_key, kid)
+    assert content["algorithm"] == "rc.v2.aes-sha2"
+    assert e2e.decrypt_message_content(content, session_key)["msg"] == "secret hello"
+
+
+def test_handle_rc_message_decrypts_e2e_dm_before_emitting(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    room = adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True)
+    rc._rooms = {"ROOM1": room}
+    rc._e2e = object()
+    events = []
+
+    async def fake_decrypt(msg, room_info):
+        assert msg["t"] == "e2e"
+        assert room_info.rid == "ROOM1"
+        out = dict(msg)
+        out["t"] = "e2e"
+        out["e2e"] = "done"
+        out["msg"] = "decrypted hello"
+        return out
+
+    def fake_build_source(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    monkeypatch.setattr(rc, "_decrypt_e2e_message", fake_decrypt)
+    monkeypatch.setattr(rc, "build_source", fake_build_source)
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+
+    msg = {
+        "_id": "e2e-msg1",
+        "rid": "ROOM1",
+        "t": "e2e",
+        "content": {"algorithm": "rc.v2.aes-sha2", "kid": "kid", "iv": "iv", "ciphertext": "ct"},
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert len(events) == 1
+    assert events[0].text == "decrypted hello"
+
+
+def test_send_uses_chat_send_message_for_encrypted_dm(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True)}
+    rc._e2e = object()
+    calls = []
+
+    async def fake_prepare(room):
+        return True
+
+    class FakeE2E:
+        def encrypt_message_payload(self, rid, text):
+            return {"rid": rid, "content": {"algorithm": "rc.v2.aes-sha2", "kid": "kid", "iv": "iv", "ciphertext": "ct"}, "t": "e2e", "e2e": "pending"}
+
+    async def fake_api_post(path, payload):
+        calls.append((path, payload))
+        return {"success": True, "message": {"_id": "encrypted-msg"}}
+
+    rc._e2e = FakeE2E()
+    monkeypatch.setattr(rc, "_prepare_e2e_room", fake_prepare)
+    monkeypatch.setattr(rc, "_api_post", fake_api_post)
+
+    result = asyncio.run(rc.send("ROOM1", "encrypted response"))
+
+    assert result.success is True
+    assert result.message_id == "encrypted-msg"
+    assert calls[0][0] == "/api/v1/chat.sendMessage"
+    assert calls[0][1]["message"]["t"] == "e2e"
+    assert "text" not in calls[0][1]["message"]

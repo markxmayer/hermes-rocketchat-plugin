@@ -37,12 +37,14 @@ Environment variables override/seed config:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import mimetypes
 import os
 import random
 import re
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -64,6 +66,16 @@ _RECONNECT_JITTER = 0.2
 _STALE_MESSAGE_AGE_SEC = 5 * 60
 _MAX_INBOUND_MEDIA_BYTES = int(os.getenv("ROCKETCHAT_MAX_INBOUND_MEDIA_BYTES", str(25 * 1024 * 1024)))
 _IMAGE_MIME_PREFIX = "image/"
+
+
+def _load_e2e_module():
+    spec = importlib.util.spec_from_file_location("rocketchat_e2e", Path(__file__).resolve().with_name("e2e.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Rocket.Chat E2E helper module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _truthy(value: Any) -> bool:
@@ -134,6 +146,10 @@ class _RoomInfo:
     name: str = ""
     fname: str = ""
     t: str = "c"
+    encrypted: bool = False
+    e2e_key: str = ""
+    e2e_suggested_key: str = ""
+    e2e_key_id: str = ""
 
     @property
     def display_name(self) -> str:
@@ -297,6 +313,12 @@ class RocketChatAdapter(BasePlatformAdapter):
         self.backfill_on_connect = bool(extra.get("backfill_on_connect", _truthy(os.getenv("ROCKETCHAT_BACKFILL_ON_CONNECT", "true"))))
         self.backfill_window_seconds = int(extra.get("backfill_window_seconds") or os.getenv("ROCKETCHAT_BACKFILL_WINDOW_SECONDS", "300"))
         self.rooms_config: dict[str, Any] = extra.get("rooms", {}) if isinstance(extra.get("rooms"), dict) else {}
+        e2e_cfg = extra.get("e2e", {}) if isinstance(extra.get("e2e"), dict) else {}
+        self.e2e_enabled = bool(e2e_cfg.get("enabled", _truthy(os.getenv("ROCKETCHAT_E2E_ENABLED", "false"))))
+        self.e2e_dm_only = bool(e2e_cfg.get("dm_only", _truthy(os.getenv("ROCKETCHAT_E2E_DM_ONLY", "true"))))
+        self.e2e_password = str(e2e_cfg.get("password") or "")
+        self.e2e_password_file = str(e2e_cfg.get("password_file") or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""))
+        self.e2e_auto_create_dm_key = bool(e2e_cfg.get("auto_create_dm_key", _truthy(os.getenv("ROCKETCHAT_E2E_AUTO_CREATE_DM_KEY", "false"))))
 
         self._session: Any = None
         self._ddp = _DDPClient(self)
@@ -306,6 +328,8 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._bot_username = ""
         self._bot_name = ""
         self._rooms: dict[str, _RoomInfo] = {}
+        self._e2e: Any = None
+        self._e2e_module: Any = None
         self._dedup = MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
 
     @property
@@ -376,6 +400,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             self._bot_username = str(user.get("username") or "")
             self._bot_name = str(user.get("name") or self._bot_username or self.user_id)
             logger.info("Rocket.Chat: authenticated as @%s (%s) on %s", self._bot_username, self.user_id, self.base_url)
+            await self._init_e2e()
             await self._refresh_subscriptions()
             if self.backfill_on_connect:
                 await self._backfill_recent_messages(window_seconds=self.backfill_window_seconds)
@@ -444,7 +469,12 @@ class RocketChatAdapter(BasePlatformAdapter):
                 name=str(sub.get("name") or ""),
                 fname=str(sub.get("fname") or ""),
                 t=str(sub.get("t") or "c"),
+                encrypted=bool(sub.get("encrypted") or sub.get("E2EKey") or sub.get("E2ESuggestedKey")),
+                e2e_key=str(sub.get("E2EKey") or ""),
+                e2e_suggested_key=str(sub.get("E2ESuggestedKey") or ""),
+                e2e_key_id=str(sub.get("e2eKeyId") or sub.get("E2EKeyId") or ""),
             )
+            await self._prepare_e2e_room(self._rooms[rid])
             await self._ddp.subscribe_room(rid)
         logger.info("Rocket.Chat: tracking %d subscribed rooms", len(self._rooms))
 
@@ -481,19 +511,91 @@ class RocketChatAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("Rocket.Chat: backfill failed for room %s: %s", room.rid, exc)
 
+    async def _init_e2e(self) -> None:
+        if not self.e2e_enabled:
+            return
+        try:
+            self._e2e_module = _load_e2e_module()
+            password = self._e2e_module.load_e2e_password(explicit=self.e2e_password, file_path=self.e2e_password_file)
+            if not password:
+                logger.warning("Rocket.Chat: E2E enabled but no E2E password was configured; encrypted DMs cannot be processed")
+                return
+            self._e2e = self._e2e_module.RocketChatE2E(
+                user_id=self.user_id,
+                password=password,
+                rest_get=self._api_get,
+                rest_post=self._api_post,
+                ddp_call=self._ddp.call,
+            )
+            await self._e2e.start()
+            logger.info("Rocket.Chat: E2E helper initialized for DM-capable encrypted rooms")
+        except Exception as exc:
+            self._e2e = None
+            logger.error("Rocket.Chat: E2E initialization failed: %s", exc)
+
+    def _e2e_allowed_for_room(self, room: _RoomInfo) -> bool:
+        if not self.e2e_enabled or not self._e2e or not room.encrypted:
+            return False
+        if self.e2e_dm_only and room.t != "d":
+            return False
+        return room.t in {"d", "p"}
+
+    async def _prepare_e2e_room(self, room: _RoomInfo) -> bool:
+        if not self._e2e_allowed_for_room(room):
+            return False
+        if self._e2e.have_room(room.rid):
+            return True
+        try:
+            if room.e2e_key:
+                return bool(self._e2e.import_room_key(room.rid, room.e2e_key))
+            if room.e2e_suggested_key:
+                return bool(await self._e2e.accept_suggested_key(room.rid, room.e2e_suggested_key))
+            if room.t == "d" and self.e2e_auto_create_dm_key and not room.e2e_key_id:
+                await self._e2e.create_room_key(room.rid)
+                return True
+        except Exception as exc:
+            logger.warning("Rocket.Chat: failed to prepare E2E room %s: %s", room.rid, exc)
+        return False
+
+    async def _decrypt_e2e_message(self, msg: dict[str, Any], room: _RoomInfo) -> Optional[dict[str, Any]]:
+        if not await self._prepare_e2e_room(room):
+            logger.warning("Rocket.Chat: encrypted message in %s could not be decrypted; missing room key", room.rid)
+            return None
+        try:
+            return self._e2e.decrypt_message(msg)
+        except Exception as exc:
+            logger.warning("Rocket.Chat: encrypted message in %s could not be decrypted: %s", room.rid, exc)
+            return None
+
+    async def _send_e2e_chunk(self, room: _RoomInfo, chunk: str) -> dict[str, Any]:
+        if not await self._prepare_e2e_room(room):
+            raise RuntimeError("encrypted room key is unavailable")
+        message = self._e2e.encrypt_message_payload(room.rid, chunk)
+        data = await self._api_post("/api/v1/chat.sendMessage", {"message": message})
+        if data.get("success") is False:
+            raise RuntimeError(str(data.get("error") or "encrypted send failed"))
+        return data
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not content:
             return SendResult(success=True)
         chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)
         metadata = metadata or {}
         thread_id = metadata.get("thread_id") or metadata.get("tmid") or reply_to
+        room = self._rooms.get(str(chat_id))
+        use_e2e = bool(room and self._e2e_allowed_for_room(room))
         last_id = None
         for chunk in chunks:
-            payload: dict[str, Any] = {"roomId": str(chat_id), "text": chunk}
-            if thread_id and self._should_thread(chunk):
-                payload["tmid"] = str(thread_id)
             try:
-                data = await self._api_post("/api/v1/chat.postMessage", payload)
+                if use_e2e and room:
+                    if thread_id:
+                        logger.debug("Rocket.Chat: sending encrypted DM reply without thread metadata; Rocket.Chat E2E thread support is intentionally disabled")
+                    data = await self._send_e2e_chunk(room, chunk)
+                else:
+                    payload: dict[str, Any] = {"roomId": str(chat_id), "text": chunk}
+                    if thread_id and self._should_thread(chunk):
+                        payload["tmid"] = str(thread_id)
+                    data = await self._api_post("/api/v1/chat.postMessage", payload)
                 msg = data.get("message") or {}
                 last_id = msg.get("_id") or data.get("_id") or last_id
             except Exception as exc:
@@ -940,7 +1042,13 @@ class RocketChatAdapter(BasePlatformAdapter):
             return
         if self._dedup.is_duplicate(msg_id):
             return
-        if msg.get("t"):
+        room = self._rooms.get(rid, _RoomInfo(rid=rid))
+        if msg.get("t") == "e2e":
+            decrypted = await self._decrypt_e2e_message(msg, room)
+            if not decrypted:
+                return
+            msg = decrypted
+        elif msg.get("t"):
             return  # system/control message
         user = msg.get("u") or {}
         user_id = str(user.get("_id") or "")
@@ -952,7 +1060,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             logger.debug("Rocket.Chat: dropped stale message %s", msg_id)
             return
 
-        room = self._rooms.get(rid, _RoomInfo(rid=rid))
+        room = self._rooms.get(rid, room)
         text = str(msg.get("msg") or "")
         if not self._should_process_room_message(rid, msg, text, room):
             return
