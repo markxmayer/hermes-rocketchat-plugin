@@ -333,6 +333,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._e2e_module: Any = None
         self._e2e_armed_until: dict[str, float] = {}
         self._e2e_disable_after_reply: set[str] = set()
+        self._e2e_persistent_rooms: set[str] = set()
         self._dedup = MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
 
     @property
@@ -721,7 +722,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.error("Rocket.Chat: send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
-        if room and room.rid in self._e2e_disable_after_reply:
+        if room and room.rid in self._e2e_disable_after_reply and room.rid not in self._e2e_persistent_rooms:
             self._e2e_disable_after_reply.discard(room.rid)
             self._e2e_armed_until.pop(room.rid, None)
             try:
@@ -1174,7 +1175,37 @@ class RocketChatAdapter(BasePlatformAdapter):
             f"- my room key: {'present' if have_key else 'missing'}",
             f"- suggested key: {'present' if room.e2e_suggested_key else 'missing'}",
             f"- one-shot exchange: {'armed' if armed else 'not armed'}",
+            f"- persistent mode: {'on' if room.rid in self._e2e_persistent_rooms else 'off'}",
         ])
+
+    async def _send_e2e_control_text(self, room: _RoomInfo, content: str) -> SendResult:
+        try:
+            data = await self._send_e2e_chunk(room, content)
+            msg = data.get("message") or {}
+            return SendResult(success=True, message_id=str(msg.get("_id") or data.get("_id") or "") or None)
+        except Exception as exc:
+            logger.error("Rocket.Chat: encrypted control send failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _disable_e2e_mode(self, room: _RoomInfo) -> None:
+        self._e2e_armed_until.pop(room.rid, None)
+        self._e2e_disable_after_reply.discard(room.rid)
+        self._e2e_persistent_rooms.discard(room.rid)
+        await self._set_room_encrypted(room, False)
+
+    async def _handle_encrypted_e2e_control(self, room: _RoomInfo, text: str) -> bool:
+        raw = (text or "").strip().lower()
+        if raw not in {"e2e off", "e2e cancel", "e2e stop", "e2e status", "e2e state"}:
+            return False
+        if raw in {"e2e status", "e2e state"}:
+            await self._send_e2e_control_text(room, self._e2e_status_text(room))
+            return True
+        await self._send_e2e_control_text(room, "Turning E2E persistent mode off; normal DM mode restored.")
+        try:
+            await self._disable_e2e_mode(room)
+        except Exception as exc:
+            logger.warning("Rocket.Chat: failed to disable persistent E2E room %s: %s", room.rid, exc)
+        return True
 
     async def _handle_e2e_command(self, room: _RoomInfo, text: str) -> bool:
         raw = (text or "").strip()
@@ -1186,19 +1217,27 @@ class RocketChatAdapter(BasePlatformAdapter):
             await self._send_plain_text(room.rid, self._e2e_status_text(room))
             return True
         if subcmd in {"cancel", "off", "stop"}:
-            self._e2e_armed_until.pop(room.rid, None)
-            self._e2e_disable_after_reply.discard(room.rid)
             try:
-                await self._set_room_encrypted(room, False)
+                await self._disable_e2e_mode(room)
             except Exception as exc:
                 logger.debug("Rocket.Chat: E2E cancel could not disable room %s: %s", room.rid, exc)
-            await self._send_plain_text(room.rid, "E2E one-shot exchange cancelled; normal DM mode restored.")
+            await self._send_plain_text(room.rid, "E2E mode cancelled; normal DM mode restored.")
             return True
-        if subcmd not in {"", "next", "arm", "on"}:
-            await self._send_plain_text(room.rid, "Usage: /e2e, /e2e status, or /e2e cancel. Send sensitive content only after /e2e says it is ready.")
+        if subcmd in {"on", "persist", "persistent", "stay", "keep"}:
+            ok, message = await self._ensure_e2e_exchange_ready(room)
+            if ok:
+                self._e2e_armed_until.pop(room.rid, None)
+                self._e2e_disable_after_reply.discard(room.rid)
+                self._e2e_persistent_rooms.add(room.rid)
+                message = "E2E persistent mode ready. I will keep this DM encrypted until you send `e2e off` as an encrypted message."
+            await self._send_plain_text(room.rid, message)
+            return True
+        if subcmd not in {"", "next", "arm", "once", "one-shot", "oneshot"}:
+            await self._send_plain_text(room.rid, "Usage: /e2e for one encrypted reply, /e2e on for persistent mode, /e2e status, or /e2e cancel. In persistent encrypted mode, send `e2e off` without a slash to return to plaintext.")
             return True
         ok, message = await self._ensure_e2e_exchange_ready(room)
         if ok:
+            self._e2e_persistent_rooms.discard(room.rid)
             self._e2e_armed_until[room.rid] = time.time() + 5 * 60
         await self._send_plain_text(room.rid, message)
         return True
@@ -1250,9 +1289,11 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         room = self._rooms.get(rid, room)
         text = str(msg.get("msg") or "")
+        if msg_type == "e2e" and await self._handle_encrypted_e2e_control(room, text):
+            return
         if not msg.get("__hermes_backfill") and await self._handle_e2e_command(room, text):
             return
-        if msg_type == "e2e" and self._e2e_armed_until.get(rid, 0) > time.time():
+        if msg_type == "e2e" and self._e2e_armed_until.get(rid, 0) > time.time() and rid not in self._e2e_persistent_rooms:
             self._e2e_disable_after_reply.add(rid)
         if not self._should_process_room_message(rid, msg, text, room):
             return
