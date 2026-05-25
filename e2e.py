@@ -100,39 +100,16 @@ def load_or_create_e2e_password(
     file_path: str = "",
     default_file_path: str = DEFAULT_E2E_PASSWORD_FILE,
 ) -> tuple[str, str, bool]:
-    """Load the E2E recovery password, creating a local one when absent.
+    """Load the E2E recovery password without creating key material.
 
-    Returns (password, path, created).  The generated secret is written with
-    owner-only permissions and must never be logged by callers.
+    Returns (password, path, created). ``created`` is always False; Hermes is
+    read-only for Rocket.Chat E2E keys and recovery secrets.
     """
     password = load_e2e_password(explicit=explicit, env_var=env_var, file_path=file_path)
     if password:
         return password, file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""), False
-
     path_text = file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", "") or default_file_path
-    path = Path(path_text).expanduser()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        pass
-
-    if path.exists():
-        existing = _load_secret_file(str(path))
-        if existing:
-            return existing, str(path), False
-
-    password = generate_passphrase()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(path), flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("# Local Rocket.Chat E2E recovery password for Hermes. Do not commit or share.\n")
-        fh.write(f"ROCKETCHAT_E2E_PASSWORD={password}\n")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-    return password, str(path), True
+    raise RuntimeError(f"Rocket.Chat E2E recovery key is not configured; set it first in {path_text}")
 
 
 def decode_private_key(encrypted_private_key: str, password: str, user_id: str) -> str:
@@ -395,34 +372,21 @@ class RocketChatE2E:
         public_key = str(keys.get("public_key") or "")
         encrypted_private_key = str(keys.get("private_key") or "")
         if not public_key or not encrypted_private_key:
-            public_key, private_key = generate_rsa_jwks()
-            encrypted_private_key = encode_private_key(private_key, self.password, self.user_id)
-            await self._rest_post(
-                "/api/v1/e2e.setUserPublicAndPrivateKeys",
-                {"public_key": public_key, "private_key": encrypted_private_key},
+            raise RuntimeError(
+                "Rocket.Chat E2E identity is not set for this user. Set the E2E recovery key/identity in a Rocket.Chat client first; Hermes will only read existing keys."
             )
-            self.private_key_json = private_key
-        else:
-            try:
-                self.private_key_json = decode_private_key(encrypted_private_key, self.password, self.user_id)
-            except Exception:
-                if not self.force_unreadable_identity:
-                    raise
-                public_key, private_key = generate_rsa_jwks()
-                encrypted_private_key = encode_private_key(private_key, self.password, self.user_id)
-                await self._rest_post(
-                    "/api/v1/e2e.setUserPublicAndPrivateKeys",
-                    {"public_key": public_key, "private_key": encrypted_private_key, "force": True},
-                )
-                self.private_key_json = private_key
+        try:
+            self.private_key_json = decode_private_key(encrypted_private_key, self.password, self.user_id)
+        except Exception as exc:
+            raise RuntimeError(
+                "Rocket.Chat E2E identity exists but could not be decrypted with the configured recovery key. Update the configured key or reset it in Rocket.Chat; Hermes will not replace it."
+            ) from exc
         self.public_key_json = public_key
         self.encrypted_private_key_json = encrypted_private_key
         self.private_key = private_key_from_jwk(json.loads(self.private_key_json))
-        if self._ddp_call:
-            try:
-                await self._ddp_call("e2e.requestSubscriptionKeys", [])
-            except Exception:
-                pass
+        # Read-only key policy: do not trigger Rocket.Chat key request/share flows
+        # from Hermes startup. Existing subscription room keys are imported later
+        # if Rocket.Chat has already exposed them to this user.
 
     def have_room(self, rid: str) -> bool:
         return rid in self.rooms
@@ -435,10 +399,11 @@ class RocketChatE2E:
         except Exception:
             ok = False
         if ok:
-            await self._rest_post("/api/v1/e2e.acceptSuggestedGroupKey", {"rid": rid})
-        else:
-            await self._rest_post("/api/v1/e2e.rejectSuggestedGroupKey", {"rid": rid})
-        return ok
+            # Hermes is read-only for E2E key management. Use the suggested key
+            # locally if Rocket.Chat already supplied it, but do not accept/reject
+            # or otherwise mutate key state on the server.
+            return True
+        return False
 
     def import_room_key(self, rid: str, group_key: str) -> bool:
         if not self.private_key or not group_key:
@@ -472,16 +437,7 @@ class RocketChatE2E:
         return data.get("result")
 
     async def create_room_key(self, rid: str) -> RoomE2EState:
-        kid, session_key_json, session_key = generate_session_key()
-        await self._method_call("e2e.setRoomKeyID", [rid, kid])
-        if not self.public_key_json:
-            raise RuntimeError("E2E public key not loaded")
-        my_key = encrypt_session_key_for_public(session_key_json, kid, self.public_key_json)
-        await self._rest_post("/api/v1/e2e.updateGroupKey", {"rid": rid, "uid": self.user_id, "key": my_key})
-        state = RoomE2EState(rid=rid, kid=kid, session_key_json=session_key_json, session_key=session_key)
-        self.rooms[rid] = state
-        await self.distribute_room_key(rid)
-        return state
+        raise RuntimeError("Hermes E2E key management is read-only; create the room key in Rocket.Chat")
 
     async def reset_room_key(self, rid: str) -> RoomE2EState:
         """Rotate an existing encrypted room to a key generated by this client.
@@ -492,66 +448,21 @@ class RocketChatE2E:
         key on this user's subscription, and queues other users for suggested-key
         distribution.
         """
-        if not self.public_key_json:
-            raise RuntimeError("E2E public key not loaded")
-        kid, session_key_json, session_key = generate_session_key()
-        my_key = encrypt_session_key_for_public(session_key_json, kid, self.public_key_json)
-        await self._rest_post("/api/v1/e2e.resetRoomKey", {"rid": rid, "e2eKeyId": kid, "e2eKey": my_key})
-        state = RoomE2EState(rid=rid, kid=kid, session_key_json=session_key_json, session_key=session_key)
-        self.rooms[rid] = state
-        await self.distribute_room_key(rid)
-        return state
+        raise RuntimeError("Hermes E2E key management is read-only; rotate room keys in Rocket.Chat")
 
     async def request_subscription_keys(self) -> bool:
-        await self._method_call("e2e.requestSubscriptionKeys", [])
-        return True
+        return False
 
     async def queue_me_for_room_keys(self) -> bool:
-        """Ask Rocket.Chat to add this user's encrypted rooms without E2EKey to the key-sharing queue.
-
-        Re-posting the same user E2E identity with force=true is the official code
-        path that calls Rooms.addUserIdToE2EEQueueByRoomIds(...) for encrypted
-        subscribed rooms where this user lacks an E2EKey. This does not rotate the
-        bot identity because it sends the already-loaded public/private key pair.
-        """
-        if not self.public_key_json or not self.encrypted_private_key_json:
-            return False
-        await self._rest_post(
-            "/api/v1/e2e.setUserPublicAndPrivateKeys",
-            {"public_key": self.public_key_json, "private_key": self.encrypted_private_key_json, "force": True},
-        )
-        return True
+        """Do not repost user identity/key material from Hermes."""
+        return False
 
     async def request_room_key(self, rid: str, key_id: str) -> bool:
-        if not key_id:
-            return False
-        await self._method_call("stream-notify-room-users", [f"{rid}/e2ekeyRequest", rid, key_id])
-        return True
+        return False
 
     async def distribute_room_key(self, rid: str) -> int:
-        """Share our cached room key using Rocket.Chat's official suggested-key flow."""
-        state = self.rooms.get(rid)
-        if not state:
-            return 0
-        users: list[dict[str, Any]] = []
-        result = await self._method_call("e2e.getUsersOfRoomWithoutKey", [rid])
-        if isinstance(result, dict):
-            users = [u for u in result.get("users") or [] if isinstance(u, dict)]
-        suggestions = []
-        for user in users:
-            uid = str(user.get("_id") or "")
-            public_key = str(((user.get("e2e") or {}) if isinstance(user.get("e2e"), dict) else {}).get("public_key") or "")
-            if not uid or uid == self.user_id or not public_key:
-                continue
-            try:
-                key = encrypt_session_key_for_public(state.session_key_json, state.kid, public_key)
-            except Exception:
-                continue
-            suggestions.append({"_id": uid, "key": key})
-        if not suggestions:
-            return 0
-        await self._rest_post("/api/v1/e2e.provideUsersSuggestedGroupKeys", {"usersSuggestedGroupKeys": {rid: suggestions}})
-        return len(suggestions)
+        """Do not share/modify room keys from Hermes."""
+        return 0
 
     def decrypt_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         rid = str(msg.get("rid") or "")

@@ -40,10 +40,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-v0.3.3 local fix (`fix: use decrypted attachment E2EE file metadata`)
+v0.3.4 local fix (`fix: make Rocket.Chat E2E key handling read-only`)
 ```
 
-Plugin version: `0.3.3`
+Plugin version: `0.3.4`
 
 ## Current capabilities
 
@@ -73,7 +73,7 @@ Plugin version: `0.3.3`
 - Inbound E2EE DM image attachments are decrypted from Rocket.Chat's AES-CTR file payloads using decrypted attachment-level file metadata and then verified with image magic bytes before caching for Hermes vision.
 - One-shot encrypted DM exchanges with `e2e1`.
 - Persistent encrypted DM mode with `e2e_on`; disable while encrypted by sending `e2e_off` as encrypted text. `e2e_status` reports helper/key state. Legacy `/e2e` slash aliases remain accepted but are not recommended because Rocket.Chat may display parser warnings or block slash commands while encrypted.
-- E2E key-sharing helpers for existing rooms, stale-key rotation fallback, and bot key-share queueing without rotating the bot RSA identity.
+- E2E key handling is read-only: Hermes uses existing Rocket.Chat E2E identity/room keys only and never creates, rotates, requests, shares, accepts/rejects, or replaces keys.
 
 ## Verification run
 
@@ -115,8 +115,8 @@ ROCKETCHAT_MARK_AS_READ=true
 ROCKETCHAT_BACKFILL_ON_CONNECT=true
 ROCKETCHAT_BACKFILL_WINDOW_SECONDS=300
 
-# Optional DM-only E2EE. If this file is absent and E2E is enabled,
-# Hermes generates a local recovery password file with mode 0600.
+# Optional DM-only E2EE. Configure the same recovery key used by the Rocket.Chat client.
+# Hermes only reads existing E2E identities/room keys; it does not create or change keys.
 ROCKETCHAT_E2E_ENABLED=true
 ROCKETCHAT_E2E_DM_ONLY=true
 ROCKETCHAT_E2E_PASSWORD_FILE=~/.hermes/secrets/rocketchat-e2e.env

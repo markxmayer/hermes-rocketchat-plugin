@@ -83,6 +83,8 @@ def _bare_adapter():
     rc.e2e_enabled = False
     rc.e2e_dm_only = True
     rc.e2e_auto_create_dm_key = False
+    rc.e2e_allow_room_key_rotation = False
+    rc.e2e_queue_self_for_keys = False
     rc._e2e = None
     rc._e2e_armed_until = {}
     rc._e2e_disable_after_reply = set()
@@ -487,7 +489,7 @@ def test_handle_rc_message_skips_restart_persistent_duplicate(monkeypatch, tmp_p
     assert events == []
 
 
-def test_handle_e2e_command_schedules_delayed_ready_watch_when_key_missing(monkeypatch):
+def test_handle_e2e_command_reports_missing_key_without_scheduling_watch(monkeypatch):
     rc = _bare_adapter()
     rc.e2e_enabled = True
     rc._e2e = object()
@@ -514,8 +516,8 @@ def test_handle_e2e_command_schedules_delayed_ready_watch_when_key_missing(monke
     handled = asyncio.run(rc._handle_e2e_command(room, "e2e1"))
 
     assert handled is True
-    assert scheduled == [("ROOM1", False)]
-    assert "should not need to send `e2e1` again" in sent[0][1]
+    assert scheduled == []
+    assert sent == [("ROOM1", "missing key")]
 
 
 def test_plain_e2e_word_does_not_trigger_control_command(monkeypatch):
@@ -681,20 +683,21 @@ def test_e2e_decrypt_message_exposes_decrypted_file_encryption_metadata():
     assert decrypted["files"][0]["encryption"]["type"] == "image/png"
 
 
-def test_e2e_helper_creates_password_file_when_absent(tmp_path):
+def test_e2e_helper_refuses_to_create_password_file_when_absent(tmp_path):
     e2e = adapter._load_e2e_module()
     secret_path = tmp_path / "rocketchat-e2e.env"
 
-    password, path, created = e2e.load_or_create_e2e_password(file_path=str(secret_path))
+    try:
+        e2e.load_or_create_e2e_password(file_path=str(secret_path))
+    except RuntimeError as exc:
+        assert "recovery key is not configured" in str(exc)
+    else:
+        raise AssertionError("Hermes must not generate Rocket.Chat E2E recovery secrets")
 
-    assert created is True
-    assert password.startswith("hermes-")
-    assert path == str(secret_path)
-    assert e2e.load_e2e_password(file_path=str(secret_path)) == password
-    assert secret_path.stat().st_mode & 0o077 == 0
+    assert not secret_path.exists()
 
 
-def test_e2e_start_generates_identity_when_server_has_no_keys(tmp_path):
+def test_e2e_start_refuses_to_generate_identity_when_server_has_no_keys(tmp_path):
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -708,20 +711,19 @@ def test_e2e_start_generates_identity_when_server_has_no_keys(tmp_path):
 
     async def run():
         helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
-        await helper.start()
-        assert helper.public_key_json
-        assert helper.private_key is not None
+        try:
+            await helper.start()
+        except RuntimeError as exc:
+            assert "identity is not set" in str(exc)
+        else:
+            raise AssertionError("missing E2E identity must fail read-only startup")
 
     asyncio.run(run())
 
-    assert posts
-    assert posts[0][0] == "/api/v1/e2e.setUserPublicAndPrivateKeys"
-    assert "public_key" in posts[0][1]
-    assert "private_key" in posts[0][1]
-    assert "generated-password" not in adapter.json.dumps(posts[0][1])
+    assert posts == []
 
 
-def test_e2e_start_force_replaces_unreadable_existing_identity():
+def test_e2e_start_refuses_to_replace_unreadable_existing_identity():
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -740,17 +742,19 @@ def test_e2e_start_force_replaces_unreadable_existing_identity():
             rest_post=fake_post,
             force_unreadable_identity=True,
         )
-        await helper.start()
-        assert helper.public_key_json != "old-public"
-        assert helper.private_key is not None
+        try:
+            await helper.start()
+        except RuntimeError as exc:
+            assert "will not replace it" in str(exc)
+        else:
+            raise AssertionError("unreadable E2E identity must not be replaced")
 
     asyncio.run(run())
 
-    assert posts[0][0] == "/api/v1/e2e.setUserPublicAndPrivateKeys"
-    assert posts[0][1]["force"] is True
+    assert posts == []
 
 
-def test_e2e_rejects_unreadable_suggested_room_key():
+def test_e2e_does_not_accept_or_reject_unreadable_suggested_room_key():
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -771,10 +775,10 @@ def test_e2e_rejects_unreadable_suggested_room_key():
 
     asyncio.run(run())
 
-    assert posts == [("/api/v1/e2e.rejectSuggestedGroupKey", {"rid": "ROOM1"})]
+    assert posts == []
 
 
-def test_e2e_requests_room_key_via_notify_room_users_stream():
+def test_e2e_does_not_request_room_key_via_notify_room_users_stream():
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -787,17 +791,14 @@ def test_e2e_requests_room_key_via_notify_room_users_stream():
 
     async def run():
         helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
-        assert await helper.request_room_key("ROOM1", "kid1") is True
+        assert await helper.request_room_key("ROOM1", "kid1") is False
 
     asyncio.run(run())
 
-    assert posts[0][0] == "/api/v1/method.call/stream-notify-room-users"
-    message = adapter.json.loads(posts[0][1]["message"])
-    assert message["method"] == "stream-notify-room-users"
-    assert message["params"] == ["ROOM1/e2ekeyRequest", "ROOM1", "kid1"]
+    assert posts == []
 
 
-def test_e2e_queues_self_for_room_key_sharing_without_rotating_identity():
+def test_e2e_does_not_repost_user_identity_for_room_key_sharing():
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -812,18 +813,14 @@ def test_e2e_queues_self_for_room_key_sharing_without_rotating_identity():
         helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
         helper.public_key_json = "public-json"
         helper.encrypted_private_key_json = "encrypted-private-json"
-        assert await helper.queue_me_for_room_keys() is True
+        assert await helper.queue_me_for_room_keys() is False
 
     asyncio.run(run())
 
-    assert posts == [("/api/v1/e2e.setUserPublicAndPrivateKeys", {
-        "public_key": "public-json",
-        "private_key": "encrypted-private-json",
-        "force": True,
-    })]
+    assert posts == []
 
 
-def test_e2e_resets_existing_room_key_with_official_endpoint():
+def test_e2e_refuses_to_reset_existing_room_key():
     e2e = adapter._load_e2e_module()
     posts = []
 
@@ -832,32 +829,24 @@ def test_e2e_resets_existing_room_key_with_official_endpoint():
 
     async def fake_post(path, payload):
         posts.append((path, payload))
-        if path == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey":
-            return {"success": True, "message": adapter.json.dumps({"result": {"users": []}})}
         return {"success": True}
 
     async def run():
         helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
-        public_key, private_key = e2e.generate_rsa_jwks()
-        helper.public_key_json = public_key
-        helper.private_key_json = private_key
-        helper.private_key = e2e.private_key_from_jwk(adapter.json.loads(private_key))
-        state = await helper.reset_room_key("ROOM1")
-        assert helper.have_room("ROOM1") is True
-        assert state.kid
+        try:
+            await helper.reset_room_key("ROOM1")
+        except RuntimeError as exc:
+            assert "read-only" in str(exc)
+        else:
+            raise AssertionError("reset_room_key must be disabled")
 
     asyncio.run(run())
 
-    assert posts[0][0] == "/api/v1/e2e.resetRoomKey"
-    payload = posts[0][1]
-    assert payload["rid"] == "ROOM1"
-    assert isinstance(payload["e2eKeyId"], str) and payload["e2eKeyId"]
-    assert isinstance(payload["e2eKey"], str) and payload["e2eKey"]
+    assert posts == []
 
 
-def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
+def test_e2e_does_not_distribute_cached_room_key():
     e2e = adapter._load_e2e_module()
-    peer_public, _peer_private = e2e.generate_rsa_jwks()
     posts = []
 
     async def fake_get(path, *, params=None):
@@ -865,11 +854,6 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
 
     async def fake_post(path, payload):
         posts.append((path, payload))
-        if path == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey":
-            return {"success": True, "message": adapter.json.dumps({"result": {"users": [
-                {"_id": "human-id", "e2e": {"public_key": peer_public}},
-                {"_id": "bot-user-id", "e2e": {"public_key": peer_public}},
-            ]}})}
         return {"success": True}
 
     async def run():
@@ -881,16 +865,68 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
         )
         kid, session_key_json, session_key = e2e.generate_session_key()
         helper.rooms["ROOM1"] = e2e.RoomE2EState(rid="ROOM1", kid=kid, session_key_json=session_key_json, session_key=session_key)
-        assert await helper.distribute_room_key("ROOM1") == 1
+        assert await helper.distribute_room_key("ROOM1") == 0
 
     asyncio.run(run())
 
-    assert posts[0][0] == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey"
-    assert posts[1][0] == "/api/v1/e2e.provideUsersSuggestedGroupKeys"
-    suggestions = posts[1][1]["usersSuggestedGroupKeys"]["ROOM1"]
-    assert len(suggestions) == 1
-    assert suggestions[0]["_id"] == "human-id"
-    assert isinstance(suggestions[0]["key"], str) and suggestions[0]["key"]
+    assert posts == []
+
+
+def test_e2e_prepare_does_not_rotate_recreate_request_or_share_keys(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    calls = []
+
+    class FakeE2E:
+        def have_room(self, rid):
+            return False
+
+        async def request_subscription_keys(self):
+            calls.append("request_subscription_keys")
+            raise AssertionError("must not request key management")
+
+        async def request_room_key(self, rid, key_id):
+            calls.append(("request_room_key", rid, key_id))
+            raise AssertionError("must not request room keys")
+
+        async def reset_room_key(self, rid):
+            calls.append(("reset_room_key", rid))
+            raise AssertionError("must not rotate room keys")
+
+        async def create_room_key(self, rid):
+            calls.append(("create_room_key", rid))
+            raise AssertionError("must not create room keys")
+
+        async def distribute_room_key(self, rid):
+            calls.append(("distribute_room_key", rid))
+            raise AssertionError("must not share room keys")
+
+        async def queue_me_for_room_keys(self):
+            calls.append("queue_me_for_room_keys")
+            raise AssertionError("must not repost user identity")
+
+    rc._e2e = FakeE2E()
+    room = adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True, e2e_key_id="kid1")
+
+    async def fake_refresh_subscriptions():
+        return None
+
+    async def fake_refresh_room_info(room_arg):
+        return room_arg
+
+    async def fake_wait(room_arg):
+        calls.append("wait_for_key")
+        raise AssertionError("must not poll waiting for key changes")
+
+    monkeypatch.setattr(rc, "_refresh_subscriptions", fake_refresh_subscriptions)
+    monkeypatch.setattr(rc, "_refresh_room_info", fake_refresh_room_info)
+    monkeypatch.setattr(rc, "_wait_for_e2e_room_key", fake_wait)
+
+    ok, message = asyncio.run(rc._ensure_e2e_exchange_ready(room))
+
+    assert ok is False
+    assert "will only use an existing key" in message
+    assert calls == []
 
 
 def test_refresh_subscriptions_does_not_treat_cached_e2e_key_as_room_encrypted(monkeypatch):
