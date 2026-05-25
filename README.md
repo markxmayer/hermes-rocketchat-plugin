@@ -155,7 +155,7 @@ python -m pytest ~/.hermes/plugins/rocketchat/test_adapter.py -q -o 'addopts='
 Expected current result:
 
 ```text
-21 passed
+23 passed
 ```
 
 ## Live smoke-test checklist

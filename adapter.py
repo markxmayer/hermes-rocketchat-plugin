@@ -1049,12 +1049,30 @@ class RocketChatAdapter(BasePlatformAdapter):
         if self._dedup.is_duplicate(msg_id):
             return
         room = self._rooms.get(rid, _RoomInfo(rid=rid))
-        if msg.get("t") == "e2e":
+        msg_type = msg.get("t")
+        if msg_type in {"room_e2e_enabled", "room_e2e_disabled"}:
+            # Rocket.Chat can toggle E2E on the same DM room briefly. Refresh
+            # immediately instead of waiting for the periodic subscription poll,
+            # otherwise we can miss a short-lived suggested room key window.
+            room.encrypted = msg_type == "room_e2e_enabled"
+            self._rooms[rid] = room
+            if self.e2e_enabled:
+                asyncio.create_task(self._refresh_subscriptions())
+            return
+        if msg_type == "e2e":
+            if not room.encrypted:
+                room.encrypted = True
+                self._rooms[rid] = room
+                try:
+                    await self._refresh_subscriptions()
+                    room = self._rooms.get(rid, room)
+                except Exception as exc:
+                    logger.debug("Rocket.Chat: E2E subscription refresh failed for %s: %s", rid, exc)
             decrypted = await self._decrypt_e2e_message(msg, room)
             if not decrypted:
                 return
             msg = decrypted
-        elif msg.get("t"):
+        elif msg_type:
             return  # system/control message
         user = msg.get("u") or {}
         user_id = str(user.get("_id") or "")

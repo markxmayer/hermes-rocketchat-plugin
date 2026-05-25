@@ -430,6 +430,83 @@ def test_e2e_rejects_unreadable_suggested_room_key():
     assert posts == [("/api/v1/e2e.rejectSuggestedGroupKey", {"rid": "ROOM1"})]
 
 
+def test_handle_room_e2e_toggle_refreshes_subscriptions(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=False)}
+    refreshes = []
+
+    async def fake_refresh():
+        refreshes.append(True)
+
+    monkeypatch.setattr(rc, "_refresh_subscriptions", fake_refresh)
+
+    msg = {
+        "_id": "toggle1",
+        "rid": "ROOM1",
+        "t": "room_e2e_enabled",
+        "msg": "mark",
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    async def run():
+        await rc._handle_rc_message(msg)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert rc._rooms["ROOM1"].encrypted is True
+    assert refreshes == [True]
+
+
+def test_handle_e2e_message_marks_room_encrypted_and_refreshes_before_decrypt(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    room = adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=False)
+    rc._rooms = {"ROOM1": room}
+    rc._e2e = object()
+    events = []
+    refreshes = []
+
+    async def fake_refresh():
+        refreshes.append(True)
+        rc._rooms["ROOM1"].e2e_suggested_key = "suggested"
+
+    async def fake_decrypt(msg, room_info):
+        assert room_info.encrypted is True
+        assert room_info.e2e_suggested_key == "suggested"
+        out = dict(msg)
+        out["e2e"] = "done"
+        out["msg"] = "decrypted after refresh"
+        return out
+
+    def fake_build_source(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    monkeypatch.setattr(rc, "_refresh_subscriptions", fake_refresh)
+    monkeypatch.setattr(rc, "_decrypt_e2e_message", fake_decrypt)
+    monkeypatch.setattr(rc, "build_source", fake_build_source)
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+
+    msg = {
+        "_id": "e2e-refresh-msg1",
+        "rid": "ROOM1",
+        "t": "e2e",
+        "content": {"algorithm": "rc.v2.aes-sha2", "kid": "kid", "iv": "iv", "ciphertext": "ct"},
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert refreshes == [True]
+    assert events[0].text == "decrypted after refresh"
+
+
 def test_handle_rc_message_decrypts_e2e_dm_before_emitting(monkeypatch):
     rc = _bare_adapter()
     rc.e2e_enabled = True
