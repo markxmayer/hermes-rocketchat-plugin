@@ -319,6 +319,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         self.e2e_password = str(e2e_cfg.get("password") or "")
         self.e2e_password_file = str(e2e_cfg.get("password_file") or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""))
         self.e2e_auto_create_dm_key = bool(e2e_cfg.get("auto_create_dm_key", _truthy(os.getenv("ROCKETCHAT_E2E_AUTO_CREATE_DM_KEY", "false"))))
+        self.e2e_force_unreadable_identity = bool(e2e_cfg.get("force_unreadable_identity", _truthy(os.getenv("ROCKETCHAT_E2E_FORCE_UNREADABLE_IDENTITY", "false"))))
 
         self._session: Any = None
         self._ddp = _DDPClient(self)
@@ -516,16 +517,21 @@ class RocketChatAdapter(BasePlatformAdapter):
             return
         try:
             self._e2e_module = _load_e2e_module()
-            password = self._e2e_module.load_e2e_password(explicit=self.e2e_password, file_path=self.e2e_password_file)
-            if not password:
-                logger.warning("Rocket.Chat: E2E enabled but no E2E password was configured; encrypted DMs cannot be processed")
-                return
+            password, password_path, password_created = self._e2e_module.load_or_create_e2e_password(
+                explicit=self.e2e_password,
+                file_path=self.e2e_password_file,
+            )
+            if password_created:
+                logger.info("Rocket.Chat: generated local E2E recovery password file at %s", password_path)
+            elif password_path:
+                logger.info("Rocket.Chat: loaded local E2E recovery password file at %s", password_path)
             self._e2e = self._e2e_module.RocketChatE2E(
                 user_id=self.user_id,
                 password=password,
                 rest_get=self._api_get,
                 rest_post=self._api_post,
                 ddp_call=self._ddp.call,
+                force_unreadable_identity=self.e2e_force_unreadable_identity,
             )
             await self._e2e.start()
             logger.info("Rocket.Chat: E2E helper initialized for DM-capable encrypted rooms")

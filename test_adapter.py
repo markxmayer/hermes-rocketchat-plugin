@@ -337,6 +337,75 @@ def test_e2e_helper_encrypts_and_decrypts_dm_message_roundtrip():
     assert e2e.decrypt_message_content(content, session_key)["msg"] == "secret hello"
 
 
+def test_e2e_helper_creates_password_file_when_absent(tmp_path):
+    e2e = adapter._load_e2e_module()
+    secret_path = tmp_path / "rocketchat-e2e.env"
+
+    password, path, created = e2e.load_or_create_e2e_password(file_path=str(secret_path))
+
+    assert created is True
+    assert password.startswith("hermes-")
+    assert path == str(secret_path)
+    assert e2e.load_e2e_password(file_path=str(secret_path)) == password
+    assert secret_path.stat().st_mode & 0o077 == 0
+
+
+def test_e2e_start_generates_identity_when_server_has_no_keys(tmp_path):
+    e2e = adapter._load_e2e_module()
+    posts = []
+
+    async def fake_get(path, *, params=None):
+        assert path == "/api/v1/e2e.fetchMyKeys"
+        return {"success": True}
+
+    async def fake_post(path, payload):
+        posts.append((path, payload))
+        return {"success": True}
+
+    async def run():
+        helper = e2e.RocketChatE2E(user_id="bot-user-id", password="generated-password", rest_get=fake_get, rest_post=fake_post)
+        await helper.start()
+        assert helper.public_key_json
+        assert helper.private_key is not None
+
+    asyncio.run(run())
+
+    assert posts
+    assert posts[0][0] == "/api/v1/e2e.setUserPublicAndPrivateKeys"
+    assert "public_key" in posts[0][1]
+    assert "private_key" in posts[0][1]
+    assert "generated-password" not in adapter.json.dumps(posts[0][1])
+
+
+def test_e2e_start_force_replaces_unreadable_existing_identity():
+    e2e = adapter._load_e2e_module()
+    posts = []
+
+    async def fake_get(path, *, params=None):
+        return {"success": True, "public_key": "old-public", "private_key": '{"bad":"blob"}'}
+
+    async def fake_post(path, payload):
+        posts.append((path, payload))
+        return {"success": True}
+
+    async def run():
+        helper = e2e.RocketChatE2E(
+            user_id="bot-user-id",
+            password="generated-password",
+            rest_get=fake_get,
+            rest_post=fake_post,
+            force_unreadable_identity=True,
+        )
+        await helper.start()
+        assert helper.public_key_json != "old-public"
+        assert helper.private_key is not None
+
+    asyncio.run(run())
+
+    assert posts[0][0] == "/api/v1/e2e.setUserPublicAndPrivateKeys"
+    assert posts[0][1]["force"] is True
+
+
 def test_handle_rc_message_decrypts_e2e_dm_before_emitting(monkeypatch):
     rc = _bare_adapter()
     rc.e2e_enabled = True

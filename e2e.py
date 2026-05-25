@@ -72,21 +72,66 @@ def _load_secret_file(path: str) -> str:
     return ""
 
 
+DEFAULT_E2E_PASSWORD_FILE = "~/.hermes/secrets/rocketchat-e2e.env"
+
+
 def load_e2e_password(*, explicit: str = "", env_var: str = "ROCKETCHAT_E2E_PASSWORD", file_path: str = "") -> str:
     if explicit:
         return explicit
     if os.getenv(env_var):
         return os.environ[env_var]
     path = file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", "")
-    if path:
+    if path and Path(path).expanduser().exists():
         return _load_secret_file(path)
     return ""
 
 
 def generate_passphrase() -> str:
-    # Rocket.Chat uses a word list in the browser.  For headless setup, a random
-    # hex token is acceptable as the local recovery phrase as long as it is saved.
+    # Rocket.Chat uses a word list in the browser.  For headless bot setup, a
+    # high-entropy local recovery token is appropriate as long as it is saved.
     return "hermes-" + secrets.token_urlsafe(32)
+
+
+def load_or_create_e2e_password(
+    *,
+    explicit: str = "",
+    env_var: str = "ROCKETCHAT_E2E_PASSWORD",
+    file_path: str = "",
+    default_file_path: str = DEFAULT_E2E_PASSWORD_FILE,
+) -> tuple[str, str, bool]:
+    """Load the E2E recovery password, creating a local one when absent.
+
+    Returns (password, path, created).  The generated secret is written with
+    owner-only permissions and must never be logged by callers.
+    """
+    password = load_e2e_password(explicit=explicit, env_var=env_var, file_path=file_path)
+    if password:
+        return password, file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""), False
+
+    path_text = file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", "") or default_file_path
+    path = Path(path_text).expanduser()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+
+    if path.exists():
+        existing = _load_secret_file(str(path))
+        if existing:
+            return existing, str(path), False
+
+    password = generate_passphrase()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("# Local Rocket.Chat E2E recovery password for Hermes. Do not commit or share.\n")
+        fh.write(f"ROCKETCHAT_E2E_PASSWORD={password}\n")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return password, str(path), True
 
 
 def decode_private_key(encrypted_private_key: str, password: str, user_id: str) -> str:
@@ -285,12 +330,22 @@ class RoomE2EState:
 
 
 class RocketChatE2E:
-    def __init__(self, *, user_id: str, password: str, rest_get: Any, rest_post: Any, ddp_call: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        user_id: str,
+        password: str,
+        rest_get: Any,
+        rest_post: Any,
+        ddp_call: Any = None,
+        force_unreadable_identity: bool = False,
+    ) -> None:
         self.user_id = user_id
         self.password = password
         self._rest_get = rest_get
         self._rest_post = rest_post
         self._ddp_call = ddp_call
+        self.force_unreadable_identity = force_unreadable_identity
         self.public_key_json = ""
         self.private_key_json = ""
         self.private_key: Optional[rsa.RSAPrivateKey] = None
@@ -309,7 +364,18 @@ class RocketChatE2E:
             )
             self.private_key_json = private_key
         else:
-            self.private_key_json = decode_private_key(encrypted_private_key, self.password, self.user_id)
+            try:
+                self.private_key_json = decode_private_key(encrypted_private_key, self.password, self.user_id)
+            except Exception:
+                if not self.force_unreadable_identity:
+                    raise
+                public_key, private_key = generate_rsa_jwks()
+                encrypted_private_key = encode_private_key(private_key, self.password, self.user_id)
+                await self._rest_post(
+                    "/api/v1/e2e.setUserPublicAndPrivateKeys",
+                    {"public_key": public_key, "private_key": encrypted_private_key, "force": True},
+                )
+                self.private_key_json = private_key
         self.public_key_json = public_key
         self.private_key = private_key_from_jwk(json.loads(self.private_key_json))
         if self._ddp_call:

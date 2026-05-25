@@ -38,7 +38,7 @@ rocketchat
 - Multiple-image sending via sequential native uploads.
 - Missed-message backfill on reconnect using recent room history endpoints.
 - Rocket.Chat-friendly text fallbacks for clarify/confirmation prompts where buttons are unavailable.
-- Optional DM-only Rocket.Chat E2EE support: decrypt incoming encrypted DM text and encrypt outgoing DM replies when the Hermes user's E2E password is available locally.
+- Optional DM-only Rocket.Chat E2EE support: decrypt incoming encrypted DM text and encrypt outgoing DM replies. If the Hermes user has no E2E identity yet, the plugin can generate its own local recovery password and publish a new keypair to Rocket.Chat.
 - Test coverage for transport, upload, backfill, prompt fallback, and deletion behavior.
 
 ## Files
@@ -93,7 +93,8 @@ ROCKETCHAT_MARK_AS_READ=true
 ROCKETCHAT_BACKFILL_ON_CONNECT=true
 ROCKETCHAT_BACKFILL_WINDOW_SECONDS=300
 
-# Optional DM-only E2EE. Prefer PASSWORD_FILE over putting the password in env/config.
+# Optional DM-only E2EE. If this file is absent and E2E is enabled,
+# Hermes generates a local recovery password file with mode 0600.
 ROCKETCHAT_E2E_ENABLED=true
 ROCKETCHAT_E2E_DM_ONLY=true
 ROCKETCHAT_E2E_PASSWORD_FILE=~/.hermes/secrets/rocketchat-e2e.env
@@ -154,7 +155,7 @@ python -m pytest ~/.hermes/plugins/rocketchat/test_adapter.py -q -o 'addopts='
 Expected current result:
 
 ```text
-17 passed
+20 passed
 ```
 
 ## Live smoke-test checklist
@@ -166,13 +167,13 @@ Expected current result:
 - Confirm a long reply or thread reply preserves `tmid` behavior according to configured reply mode.
 - Restart the gateway, send a message during downtime, then confirm recent-message backfill catches it after reconnect if within the backfill window.
 - Test `/approve`, `/always`, and `/cancel` style confirmation text in Rocket.Chat if using command approval flows.
-- For E2EE DMs: enable E2E for the DM in Rocket.Chat, make sure the Hermes user's E2E password is saved in the configured password file, restart the gateway, then send an encrypted DM and verify the reply also appears encrypted in Rocket.Chat.
+- For E2EE DMs: enable E2E for the DM in Rocket.Chat, enable plugin E2E, restart the gateway, then send an encrypted DM and verify the reply also appears encrypted in Rocket.Chat. If the Hermes user has no E2E identity yet, the gateway creates a local recovery password file and publishes a new public/private keypair on first E2E startup.
 
 ## Notes and caveats
 
 - This is a user plugin, not an upstream Hermes core platform.
 - It uses REST for stable operations and DDP only for inbound realtime delivery.
-- E2EE is deliberately conservative: DM/private-room crypto is implemented, but the adapter defaults to DM-only and does not support encrypted media/file upload. It also needs the Hermes user's Rocket.Chat E2E password/recovery phrase; without it the server only provides encrypted blobs.
+- E2EE is deliberately conservative: DM/private-room crypto is implemented, but the adapter defaults to DM-only and does not support encrypted media/file upload. Gateway-side E2EE initialization can generate and manage Hermes's own local recovery password/keypair when the Hermes Rocket.Chat user has no existing E2E identity.
 - Rocket.Chat's DDP/realtime APIs are marked deprecated in current docs, but still remain useful for bot-style realtime inbound messages unless replacing with polling, webhooks, or a Rocket.Chat App.
 - Keep secrets in `.env` or config; never commit them into this plugin directory.
 
