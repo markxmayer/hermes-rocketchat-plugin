@@ -574,20 +574,25 @@ class RocketChatAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.debug("Rocket.Chat: E2E key distribution failed for %s: %s", room.rid, exc)
                 return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
-            if room.t == "d" and not room.e2e_key_id:
-                await self._e2e.create_room_key(room.rid)
-                await self._refresh_subscriptions()
-                return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
             if self._e2e and hasattr(self._e2e, "request_subscription_keys"):
                 try:
                     await self._e2e.request_subscription_keys()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Rocket.Chat: E2E subscription-key request failed for %s: %s", room.rid, exc)
                 await self._refresh_subscriptions()
                 room = self._rooms.get(room.rid, room)
                 if await self._prepare_e2e_room(room):
                     return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
-            return False, "E2E was enabled, but I do not have the room key yet. Leave E2E enabled briefly or send another encrypted message so your client can share the key."
+            if room.t == "d" and not room.e2e_key_id:
+                try:
+                    await self._e2e.create_room_key(room.rid)
+                    await self._refresh_subscriptions()
+                    return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
+                except Exception as exc:
+                    if "error-room-e2e-key-already-exists" not in str(exc):
+                        raise
+                    logger.info("Rocket.Chat: room %s already has an E2E key; waiting for suggested key distribution", room.rid)
+            return False, "E2E is enabled, but I do not have this room key yet. I requested it from Rocket.Chat; please wait a few seconds and try /e2e again, or leave E2E enabled long enough for your client to share the key."
         except Exception as exc:
             detail = repr(exc) if not str(exc) else str(exc)
             logger.warning("Rocket.Chat: failed to prepare one-shot E2E exchange for %s: %s", room.rid, detail)
