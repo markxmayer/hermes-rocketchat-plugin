@@ -7,7 +7,7 @@ This repository is an update-safe Hermes user plugin for Rocket.Chat gateway sup
 - Never print, commit, package, or ask the user to paste Rocket.Chat auth tokens, user IDs paired with tokens, E2E passwords, recovery phrases, private keys, room keys, or `.env` contents.
 - Do not copy Mark's E2E password file or key material to Jake or any other operator. Each Rocket.Chat bot/user must create or use its own E2E recovery password and keypair.
 - Do not reset or force-replace a bot user's Rocket.Chat E2E identity unless the operator explicitly approves the risk. Resetting the identity can make older encrypted messages unreadable to that bot user.
-- Keep E2E support DM/private-room scoped. Inbound encrypted image attachments are allowed only after byte-level image verification; encrypted media/file upload from Hermes still requires a separate implementation and test pass.
+- Keep E2E support DM/private-room scoped. Inbound encrypted image attachments must be decrypted with Rocket.Chat's per-file AES-CTR metadata and then verified with image magic bytes; encrypted media/file upload from Hermes still requires a separate implementation and test pass.
 - The gateway decrypts messages before passing them to Hermes. Rocket.Chat E2EE does not hide message text from the selected model provider unless the operator is using a local model.
 
 ## E2E configuration
@@ -117,10 +117,10 @@ Use the Hermes source venv if the system Python lacks pytest:
 /Users/mark/.hermes/hermes-agent/venv/bin/python -m pytest test_adapter.py -q -o 'addopts='
 ```
 
-Expected result for v0.3.1:
+Expected result for v0.3.2:
 
 ```text
-43 passed
+46 passed
 ```
 
 For a recipient install, verify from the extracted archive, not just the source tree.

@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import hashlib
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -96,8 +99,8 @@ def test_extract_inbound_image_prefers_original_file_link(monkeypatch):
     rc = _bare_adapter()
     downloads = []
 
-    async def fake_download(url, filename, content_type):
-        downloads.append((url, filename, content_type))
+    async def fake_download(url, filename, content_type, **kwargs):
+        downloads.append((url, filename, content_type, kwargs.get("encryption")))
         return "/tmp/hermes-image.png", "image/png"
 
     monkeypatch.setattr(rc, "_download_inbound_media", fake_download)
@@ -117,7 +120,7 @@ def test_extract_inbound_image_prefers_original_file_link(monkeypatch):
 
     assert paths == ["/tmp/hermes-image.png"]
     assert types == ["image/png"]
-    assert downloads == [("https://chat.example.com/file-upload/file123/screen.png", "screen.png", "image/png")]
+    assert downloads == [("https://chat.example.com/file-upload/file123/screen.png", "screen.png", "image/png", None)]
 
 
 def test_sniff_image_mime_detects_common_images():
@@ -168,6 +171,55 @@ def test_download_inbound_media_accepts_e2e_octet_stream_with_image_magic(monkey
     assert cached == [(png_body, ".png")]
 
 
+def test_download_inbound_media_decrypts_e2e_file_before_sniffing(monkeypatch):
+    rc = _bare_adapter()
+    encrypted_body = b"encrypted bytes"
+    plaintext = b"\x89PNG\r\n\x1a\ndecrypted png"
+    cached = []
+
+    class FakeE2E:
+        def decrypt_file_bytes(self, encryption, body):
+            assert encryption == {"key": "metadata"}
+            assert body == encrypted_body
+            return plaintext, "image/png"
+
+    class FakeResponse:
+        status = 200
+        headers = {"Content-Type": "application/octet-stream"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def read(self):
+            return encrypted_body
+
+    class FakeSession:
+        def get(self, url, headers=None, timeout=None):
+            return FakeResponse()
+
+    def fake_cache_image_from_bytes(body, ext):
+        cached.append((body, ext))
+        return "/tmp/cached-decrypted-e2e.png"
+
+    rc._session = FakeSession()
+    rc._e2e = FakeE2E()
+    monkeypatch.setattr(adapter, "cache_image_from_bytes", fake_cache_image_from_bytes)
+
+    path, mime = asyncio.run(rc._download_inbound_media(
+        "https://chat.example.com/file-upload/file123/photo.png",
+        "photo.png",
+        "image/png",
+        encryption={"key": "metadata"},
+    ))
+
+    assert path == "/tmp/cached-decrypted-e2e.png"
+    assert mime == "image/png"
+    assert cached == [(plaintext, ".png")]
+
+
 def test_handle_rc_message_emits_photo_event_with_cached_image(monkeypatch):
     rc = _bare_adapter()
     events = []
@@ -178,7 +230,7 @@ def test_handle_rc_message_emits_photo_event_with_cached_image(monkeypatch):
     async def fake_handle_message(event):
         events.append(event)
 
-    async def fake_download(url, filename, content_type):
+    async def fake_download(url, filename, content_type, **kwargs):
         return "/tmp/cached-rocketchat-image.jpg", "image/jpeg"
 
     monkeypatch.setattr(rc, "build_source", fake_build_source)
@@ -506,6 +558,89 @@ def test_e2e_helper_encrypts_and_decrypts_dm_message_roundtrip():
     content = e2e.encrypt_message_content("secret hello", session_key, kid)
     assert content["algorithm"] == "rc.v2.aes-sha2"
     assert e2e.decrypt_message_content(content, session_key)["msg"] == "secret hello"
+
+
+def test_e2e_helper_decrypts_file_metadata_and_aes_ctr_bytes():
+    e2e = adapter._load_e2e_module()
+    kid, session_key_json, session_key = e2e.generate_session_key()
+    plaintext = b"\x89PNG\r\n\x1a\nplain image bytes"
+    file_key = os.urandom(32)
+    iv = os.urandom(16)
+    encryptor = e2e.Cipher(e2e.algorithms.AES(file_key), e2e.modes.CTR(iv)).encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    encryption = {
+        "key": {
+            "kty": "oct",
+            "k": base64.urlsafe_b64encode(file_key).decode("ascii").rstrip("="),
+            "ext": True,
+            "key_ops": ["encrypt", "decrypt"],
+        },
+        "iv": base64.b64encode(iv).decode("ascii"),
+        "type": "image/png",
+        "hash": hashlib.sha256(plaintext).hexdigest(),
+    }
+    encrypted_meta = e2e.encrypt_message_content("", session_key, kid, attachments=[encryption])["ciphertext"]
+    # Re-wrap the ciphertext into a normal encrypted content object carrying the
+    # metadata dict directly; this mirrors Rocket.Chat's file.content payload.
+    metadata_content = e2e.encrypt_message_content("", session_key, kid, attachments=[encryption])
+    decrypted_meta = e2e.decrypt_message_content(metadata_content, session_key)["attachments"][0]
+
+    decrypted, mime = e2e.decrypt_file_bytes(decrypted_meta, ciphertext)
+
+    assert encrypted_meta
+    assert decrypted == plaintext
+    assert mime == "image/png"
+
+
+def test_e2e_decrypt_message_exposes_decrypted_file_encryption_metadata():
+    e2e = adapter._load_e2e_module()
+    kid, session_key_json, session_key = e2e.generate_session_key()
+    helper = e2e.RocketChatE2E(user_id="bot-user-id", password="pw", rest_get=None, rest_post=None)
+    helper.rooms["ROOM1"] = e2e.RoomE2EState("ROOM1", kid, session_key_json, session_key)
+    metadata = {
+        "key": {"kty": "oct", "k": base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")},
+        "iv": base64.b64encode(os.urandom(16)).decode("ascii"),
+        "type": "image/png",
+        "hash": hashlib.sha256(b"image").hexdigest(),
+    }
+    encrypted_file_metadata = e2e.encrypt_message_content("", session_key, kid, attachments=[metadata])
+    content = e2e.encrypt_message_content("Do you see this image?", session_key, kid)
+    encrypted_msg = {
+        "_id": "msg1",
+        "rid": "ROOM1",
+        "t": "e2e",
+        "content": {**content, "ciphertext": e2e.encrypt_message_content("", session_key, kid, attachments=[])["ciphertext"]},
+    }
+    encrypted_msg["content"] = e2e.encrypt_message_content(
+        "Do you see this image?",
+        session_key,
+        kid,
+        attachments=[{"title_link": "/file-upload/file123/photo.png"}],
+    )
+    # Rocket.Chat includes file metadata inside the encrypted message content for
+    # attachment messages.  Build that payload explicitly so the helper must
+    # decrypt the nested file.content metadata too.
+    payload = {
+        "msg": "Do you see this image?",
+        "file": {"_id": "file123", "name": "photo.png", "type": "application/octet-stream", "content": encrypted_file_metadata},
+        "files": [{"_id": "file123", "name": "photo.png", "type": "application/octet-stream", "content": encrypted_file_metadata}],
+        "attachments": [{"title_link": "/file-upload/file123/photo.png"}],
+    }
+    encrypted_msg["content"] = e2e.encrypt_message_content("", session_key, kid, attachments=[])
+    encrypted_msg["content"] = {
+        **encrypted_msg["content"],
+        "ciphertext": base64.b64encode(e2e.AESGCM(session_key).encrypt(
+            base64.b64decode(encrypted_msg["content"]["iv"]),
+            adapter.json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            None,
+        )).decode("ascii"),
+    }
+
+    decrypted = helper.decrypt_message(encrypted_msg)
+
+    assert decrypted["msg"] == "Do you see this image?"
+    assert decrypted["file"]["encryption"]["type"] == "image/png"
+    assert decrypted["files"][0]["encryption"]["type"] == "image/png"
 
 
 def test_e2e_helper_creates_password_file_when_absent(tmp_path):

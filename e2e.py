@@ -9,6 +9,7 @@ load the Hermes user's key and decrypt room session keys stored on subscriptions
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -306,6 +307,43 @@ def decrypt_message_content(content: Any, session_key: bytes) -> dict[str, Any]:
     return data
 
 
+def _decrypt_file_content_metadata(content: Any, session_key: bytes) -> dict[str, Any]:
+    """Decrypt Rocket.Chat's per-file E2EE metadata with the room key."""
+    data = decrypt_message_content(content, session_key)
+    if isinstance(data.get("attachments"), list) and data["attachments"] and isinstance(data["attachments"][0], dict):
+        return data["attachments"][0]
+    return data if isinstance(data, dict) else {}
+
+
+def decrypt_file_bytes(encryption: dict[str, Any], body: bytes) -> tuple[bytes, str]:
+    """Decrypt Rocket.Chat E2EE file bytes using decrypted file metadata.
+
+    Rocket.Chat encrypts the uploaded file itself with an ephemeral AES-CTR key.
+    That key/iv/type/hash metadata is then encrypted with the room session key and
+    stored in the file object's ``content`` field.  Callers must pass the already
+    decrypted metadata here.
+    """
+    key = encryption.get("key") if isinstance(encryption, dict) else None
+    if not isinstance(key, dict):
+        raise ValueError("missing encrypted file key metadata")
+    if str(key.get("kty") or "") != "oct":
+        raise ValueError("unsupported encrypted file key type")
+    raw_key = _b64url_decode(str(key.get("k") or ""))
+    iv = _b64decode(str(encryption.get("iv") or ""))
+    if len(raw_key) not in {16, 24, 32}:
+        raise ValueError("unsupported encrypted file AES key length")
+    if len(iv) != 16:
+        raise ValueError("unsupported encrypted file iv length")
+    decryptor = Cipher(algorithms.AES(raw_key), modes.CTR(iv)).decryptor()
+    plaintext = decryptor.update(body) + decryptor.finalize()
+    expected_hash = str(encryption.get("hash") or "").strip().lower()
+    if expected_hash:
+        actual_hash = hashlib.sha256(plaintext).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError("encrypted file hash mismatch")
+    return plaintext, str(encryption.get("type") or "").strip().lower()
+
+
 def encrypt_message_content(msg: str, session_key: bytes, kid: str, *, attachments: Optional[list[Any]] = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"msg": msg}
     if attachments:
@@ -522,10 +560,22 @@ class RocketChatE2E:
             raise RuntimeError("missing E2E room key")
         content = msg.get("content") if isinstance(msg.get("content"), dict) else msg.get("msg")
         data = decrypt_message_content(content, state.session_key)
+        for file_meta in [data.get("file") if isinstance(data.get("file"), dict) else None, *(data.get("files") or [])]:
+            if not isinstance(file_meta, dict) or not isinstance(file_meta.get("content"), dict):
+                continue
+            try:
+                file_meta["encryption"] = _decrypt_file_content_metadata(file_meta["content"], state.session_key)
+            except Exception:
+                # Keep message text/attachments usable if a specific file's
+                # metadata cannot be decrypted.  Callers will skip that file.
+                file_meta["encryption_error"] = "metadata-decrypt-failed"
         out = dict(msg)
         out.update(data)
         out["e2e"] = "done"
         return out
+
+    def decrypt_file_bytes(self, encryption: dict[str, Any], body: bytes) -> tuple[bytes, str]:
+        return decrypt_file_bytes(encryption, body)
 
     def encrypt_message_payload(self, rid: str, text: str) -> dict[str, Any]:
         state = self.rooms.get(rid)

@@ -1242,6 +1242,7 @@ class RocketChatAdapter(BasePlatformAdapter):
                 "url": self._absolute_media_url(raw_url),
                 "name": title or file_meta.get("name") or Path(unquote(urlsplit(raw_url).path)).name,
                 "type": file_meta.get("type") or attachment.get("image_type") or attachment.get("type"),
+                "encryption": file_meta.get("encryption"),
             }
 
         for file_meta in files:
@@ -1253,6 +1254,7 @@ class RocketChatAdapter(BasePlatformAdapter):
                 "url": self._absolute_media_url(f"/file-upload/{quote(file_id)}/{quote(name)}"),
                 "name": name,
                 "type": file_meta.get("type"),
+                "encryption": file_meta.get("encryption"),
             }
 
     async def _extract_inbound_media(self, msg: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -1268,8 +1270,9 @@ class RocketChatAdapter(BasePlatformAdapter):
             if not content_type.startswith(_IMAGE_MIME_PREFIX):
                 continue
             filename = self._media_filename(candidate)
+            encryption = candidate.get("encryption") if isinstance(candidate.get("encryption"), dict) else None
             try:
-                cached_path, cached_type = await self._download_inbound_media(url, filename, content_type)
+                cached_path, cached_type = await self._download_inbound_media(url, filename, content_type, encryption=encryption)
             except Exception as exc:
                 logger.warning("Rocket.Chat: failed to download inbound media %s: %s", urlsplit(url).path, exc)
                 continue
@@ -1277,7 +1280,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             media_types.append(cached_type or content_type)
         return media_paths, media_types
 
-    async def _download_inbound_media(self, url: str, filename: str, content_type: str) -> tuple[str, str]:
+    async def _download_inbound_media(self, url: str, filename: str, content_type: str, *, encryption: Optional[dict[str, Any]] = None) -> tuple[str, str]:
         """Download one authenticated Rocket.Chat image and cache it locally."""
         if self._session is None:
             raise RuntimeError("Rocket.Chat HTTP session is not connected")
@@ -1297,6 +1300,10 @@ class RocketChatAdapter(BasePlatformAdapter):
             if len(body) > _MAX_INBOUND_MEDIA_BYTES:
                 raise RuntimeError(f"media file too large: {len(body)} bytes")
             response_type = str(resp.headers.get("Content-Type") or content_type or "").split(";", 1)[0].strip().lower()
+            if encryption and self._e2e and hasattr(self._e2e, "decrypt_file_bytes"):
+                body, decrypted_type = self._e2e.decrypt_file_bytes(encryption, body)
+                if decrypted_type:
+                    response_type = decrypted_type
             sniffed_type = _sniff_image_mime(body)
             if not response_type.startswith(_IMAGE_MIME_PREFIX):
                 # Rocket.Chat E2EE file downloads can come back as generic
