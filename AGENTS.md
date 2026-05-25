@@ -117,10 +117,10 @@ Use the Hermes source venv if the system Python lacks pytest:
 /Users/mark/.hermes/hermes-agent/venv/bin/python -m pytest test_adapter.py -q -o 'addopts='
 ```
 
-Expected result for v0.3.2:
+Expected result for v0.3.3:
 
 ```text
-46 passed
+47 passed
 ```
 
 For a recipient install, verify from the extracted archive, not just the source tree.

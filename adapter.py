@@ -1222,6 +1222,7 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         file_by_id = {str(f.get("_id") or ""): f for f in files if f.get("_id")}
         file_by_name = {str(f.get("name") or ""): f for f in files if f.get("name")}
+        attachment_file_ids: set[str] = set()
 
         for attachment in msg.get("attachments") or []:
             if not isinstance(attachment, dict):
@@ -1237,18 +1238,29 @@ class RocketChatAdapter(BasePlatformAdapter):
             parts = [p for p in urlsplit(raw_url).path.split("/") if p]
             if len(parts) >= 2 and parts[0] == "file-upload":
                 file_id = parts[1]
-            file_meta = file_by_id.get(file_id) or file_by_name.get(title) or {}
+            if file_id:
+                attachment_file_ids.add(file_id)
+            matched_file_meta = file_by_id.get(file_id) or file_by_name.get(title) or {}
+            file_meta = matched_file_meta if isinstance(matched_file_meta, dict) else {}
+            encryption = attachment.get("encryption") if isinstance(attachment.get("encryption"), dict) else file_meta.get("encryption")
+            if isinstance(encryption, dict):
+                encryption = dict(encryption)
+                if not encryption.get("type") and attachment.get("image_type"):
+                    encryption["type"] = attachment.get("image_type")
+                hashes = attachment.get("hashes") if isinstance(attachment.get("hashes"), dict) else {}
+                if not encryption.get("hash") and hashes.get("sha256"):
+                    encryption["hash"] = hashes.get("sha256")
             yield {
                 "url": self._absolute_media_url(raw_url),
                 "name": title or file_meta.get("name") or Path(unquote(urlsplit(raw_url).path)).name,
-                "type": file_meta.get("type") or attachment.get("image_type") or attachment.get("type"),
-                "encryption": file_meta.get("encryption"),
+                "type": attachment.get("image_type") or file_meta.get("type") or attachment.get("type"),
+                "encryption": encryption,
             }
 
         for file_meta in files:
             file_id = str(file_meta.get("_id") or "").strip()
             name = str(file_meta.get("name") or "").strip()
-            if not file_id or not name:
+            if not file_id or not name or file_id in attachment_file_ids:
                 continue
             yield {
                 "url": self._absolute_media_url(f"/file-upload/{quote(file_id)}/{quote(name)}"),

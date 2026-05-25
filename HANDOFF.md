@@ -40,10 +40,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-v0.3.2 tag (`fix: decrypt E2EE image attachment payloads`)
+v0.3.3 local fix (`fix: use decrypted attachment E2EE file metadata`)
 ```
 
-Plugin version: `0.3.2`
+Plugin version: `0.3.3`
 
 ## Current capabilities
 
@@ -70,7 +70,7 @@ Plugin version: `0.3.2`
 - Recent-message backfill on reconnect through `channels.history`, `groups.history`, and `im.history`.
 - Rocket.Chat-friendly text fallbacks for clarify and slash-confirm flows.
 - Optional DM-only Rocket.Chat E2EE support.
-- Inbound E2EE DM image attachments are decrypted from Rocket.Chat's AES-CTR file payloads and then verified with image magic bytes before caching for Hermes vision.
+- Inbound E2EE DM image attachments are decrypted from Rocket.Chat's AES-CTR file payloads using decrypted attachment-level file metadata and then verified with image magic bytes before caching for Hermes vision.
 - One-shot encrypted DM exchanges with `e2e1`.
 - Persistent encrypted DM mode with `e2e_on`; disable while encrypted by sending `e2e_off` as encrypted text. `e2e_status` reports helper/key state. Legacy `/e2e` slash aliases remain accepted but are not recommended because Rocket.Chat may display parser warnings or block slash commands while encrypted.
 - E2E key-sharing helpers for existing rooms, stale-key rotation fallback, and bot key-share queueing without rotating the bot RSA identity.
@@ -88,7 +88,7 @@ python -m pytest test_adapter.py -q
 Expected result:
 
 ```text
-41 passed
+47 passed
 ```
 
 ## Configuration

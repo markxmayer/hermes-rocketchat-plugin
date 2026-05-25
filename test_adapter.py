@@ -123,6 +123,44 @@ def test_extract_inbound_image_prefers_original_file_link(monkeypatch):
     assert downloads == [("https://chat.example.com/file-upload/file123/screen.png", "screen.png", "image/png", None)]
 
 
+def test_extract_inbound_image_uses_decrypted_attachment_encryption(monkeypatch):
+    rc = _bare_adapter()
+    downloads = []
+
+    async def fake_download(url, filename, content_type, **kwargs):
+        downloads.append((url, filename, content_type, kwargs.get("encryption")))
+        return "/tmp/decrypted-image.png", "image/png"
+
+    monkeypatch.setattr(rc, "_download_inbound_media", fake_download)
+    msg = {
+        "file": {"_id": "file123", "name": "encrypted-name", "type": "application/octet-stream"},
+        "files": [{"_id": "file123", "name": "encrypted-name", "type": "application/octet-stream"}],
+        "attachments": [
+            {
+                "title": "screen.png",
+                "title_link": "/file-upload/file123/encrypted-name",
+                "image_url": "/file-upload/file123/encrypted-name",
+                "image_type": "image/png",
+                "encryption": {"key": {"kty": "oct", "k": "abc"}, "iv": "def"},
+                "hashes": {"sha256": "00" * 32},
+            }
+        ],
+    }
+
+    paths, types = asyncio.run(rc._extract_inbound_media(msg))
+
+    assert paths == ["/tmp/decrypted-image.png"]
+    assert types == ["image/png"]
+    assert downloads == [
+        (
+            "https://chat.example.com/file-upload/file123/encrypted-name",
+            "screen.png",
+            "image/png",
+            {"key": {"kty": "oct", "k": "abc"}, "iv": "def", "type": "image/png", "hash": "00" * 32},
+        )
+    ]
+
+
 def test_sniff_image_mime_detects_common_images():
     assert adapter._sniff_image_mime(b"\x89PNG\r\n\x1a\nrest") == "image/png"
     assert adapter._sniff_image_mime(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
