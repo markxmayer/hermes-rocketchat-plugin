@@ -589,8 +589,9 @@ class RocketChatAdapter(BasePlatformAdapter):
                     return True, "E2E ready. Send one encrypted message now; I will answer encrypted and then return the DM to normal mode."
             return False, "E2E was enabled, but I do not have the room key yet. Leave E2E enabled briefly or send another encrypted message so your client can share the key."
         except Exception as exc:
-            logger.warning("Rocket.Chat: failed to prepare one-shot E2E exchange for %s: %s", room.rid, exc)
-            return False, f"I could not prepare E2E for this room: {exc}"
+            detail = repr(exc) if not str(exc) else str(exc)
+            logger.warning("Rocket.Chat: failed to prepare one-shot E2E exchange for %s: %s", room.rid, detail)
+            return False, f"I could not prepare E2E for this room: {detail}"
 
     async def _prepare_e2e_room(self, room: _RoomInfo) -> bool:
         if not self._e2e_allowed_for_room(room):

@@ -407,15 +407,33 @@ class RocketChatE2E:
         self.rooms[rid] = RoomE2EState(rid=rid, kid=kid, session_key_json=session_key_json, session_key=session_key)
         return True
 
+    async def _method_call(self, method: str, params: list[Any] | None = None) -> Any:
+        """Call Rocket.Chat Meteor methods over REST to avoid DDP receive-loop deadlocks.
+
+        Inbound Rocket.Chat messages are handled inside the DDP websocket receive loop.
+        Awaiting a DDP method call from that same handler blocks the loop from reading
+        the result frame and eventually times out. REST method.call is slower but safe
+        from both inbound handlers and background tasks.
+        """
+        data = await self._rest_post(
+            f"/api/v1/method.call/{method}",
+            {"message": _json_dumps_compact({"msg": "method", "method": method, "params": params or []})},
+        )
+        if not isinstance(data, dict):
+            return None
+        message = data.get("message")
+        if isinstance(message, str) and message:
+            try:
+                parsed = json.loads(message)
+                if isinstance(parsed, dict):
+                    return parsed.get("result")
+            except Exception:
+                return None
+        return data.get("result")
+
     async def create_room_key(self, rid: str) -> RoomE2EState:
         kid, session_key_json, session_key = generate_session_key()
-        if self._ddp_call:
-            await self._ddp_call("e2e.setRoomKeyID", [rid, kid])
-        else:
-            await self._rest_post(
-                "/api/v1/method.call/e2e.setRoomKeyID",
-                {"message": _json_dumps_compact({"msg": "method", "method": "e2e.setRoomKeyID", "params": [rid, kid]})},
-            )
+        await self._method_call("e2e.setRoomKeyID", [rid, kid])
         if not self.public_key_json:
             raise RuntimeError("E2E public key not loaded")
         my_key = encrypt_session_key_for_public(session_key_json, kid, self.public_key_json)
@@ -426,9 +444,7 @@ class RocketChatE2E:
         return state
 
     async def request_subscription_keys(self) -> bool:
-        if not self._ddp_call:
-            return False
-        await self._ddp_call("e2e.requestSubscriptionKeys", [])
+        await self._method_call("e2e.requestSubscriptionKeys", [])
         return True
 
     async def distribute_room_key(self, rid: str) -> int:
@@ -437,22 +453,9 @@ class RocketChatE2E:
         if not state:
             return 0
         users: list[dict[str, Any]] = []
-        if self._ddp_call:
-            result = await self._ddp_call("e2e.getUsersOfRoomWithoutKey", [rid])
-            if isinstance(result, dict):
-                users = [u for u in result.get("users") or [] if isinstance(u, dict)]
-        else:
-            data = await self._rest_post(
-                "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey",
-                {"message": _json_dumps_compact({"msg": "method", "method": "e2e.getUsersOfRoomWithoutKey", "params": [rid]})},
-            )
-            message = data.get("message") if isinstance(data, dict) else None
-            if isinstance(message, str):
-                try:
-                    parsed = json.loads(message)
-                    users = [u for u in (parsed.get("result") or {}).get("users") or [] if isinstance(u, dict)]
-                except Exception:
-                    users = []
+        result = await self._method_call("e2e.getUsersOfRoomWithoutKey", [rid])
+        if isinstance(result, dict):
+            users = [u for u in result.get("users") or [] if isinstance(u, dict)]
         suggestions = []
         for user in users:
             uid = str(user.get("_id") or "")

@@ -436,20 +436,18 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
     e2e = adapter._load_e2e_module()
     peer_public, _peer_private = e2e.generate_rsa_jwks()
     posts = []
-    ddp_calls = []
 
     async def fake_get(path, *, params=None):
         return {"success": True}
 
     async def fake_post(path, payload):
         posts.append((path, payload))
+        if path == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey":
+            return {"success": True, "message": adapter.json.dumps({"result": {"users": [
+                {"_id": "human-id", "e2e": {"public_key": peer_public}},
+                {"_id": "bot-user-id", "e2e": {"public_key": peer_public}},
+            ]}})}
         return {"success": True}
-
-    async def fake_ddp_call(method, params, timeout=10.0):
-        ddp_calls.append((method, params))
-        assert method == "e2e.getUsersOfRoomWithoutKey"
-        assert params == ["ROOM1"]
-        return {"users": [{"_id": "human-id", "e2e": {"public_key": peer_public}}, {"_id": "bot-user-id", "e2e": {"public_key": peer_public}}]}
 
     async def run():
         helper = e2e.RocketChatE2E(
@@ -457,7 +455,6 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
             password="generated-password",
             rest_get=fake_get,
             rest_post=fake_post,
-            ddp_call=fake_ddp_call,
         )
         kid, session_key_json, session_key = e2e.generate_session_key()
         helper.rooms["ROOM1"] = e2e.RoomE2EState(rid="ROOM1", kid=kid, session_key_json=session_key_json, session_key=session_key)
@@ -465,9 +462,9 @@ def test_e2e_distributes_cached_room_key_with_official_suggested_key_flow():
 
     asyncio.run(run())
 
-    assert ddp_calls == [("e2e.getUsersOfRoomWithoutKey", ["ROOM1"])]
-    assert posts[0][0] == "/api/v1/e2e.provideUsersSuggestedGroupKeys"
-    suggestions = posts[0][1]["usersSuggestedGroupKeys"]["ROOM1"]
+    assert posts[0][0] == "/api/v1/method.call/e2e.getUsersOfRoomWithoutKey"
+    assert posts[1][0] == "/api/v1/e2e.provideUsersSuggestedGroupKeys"
+    suggestions = posts[1][1]["usersSuggestedGroupKeys"]["ROOM1"]
     assert len(suggestions) == 1
     assert suggestions[0]["_id"] == "human-id"
     assert isinstance(suggestions[0]["key"], str) and suggestions[0]["key"]
