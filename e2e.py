@@ -88,26 +88,26 @@ def load_e2e_password(*, explicit: str = "", env_var: str = "ROCKETCHAT_E2E_PASS
 
 
 def generate_passphrase() -> str:
-    # Rocket.Chat uses a word list in the browser.  For headless bot setup, a
-    # high-entropy local recovery token is appropriate as long as it is saved.
+    # Test/helper-only: production Hermes code is read-only for Rocket.Chat E2E
+    # secrets and must not call this to create recovery material.
     return "hermes-" + secrets.token_urlsafe(32)
 
 
-def load_or_create_e2e_password(
+def load_required_e2e_password(
     *,
     explicit: str = "",
     env_var: str = "ROCKETCHAT_E2E_PASSWORD",
     file_path: str = "",
     default_file_path: str = DEFAULT_E2E_PASSWORD_FILE,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str]:
     """Load the E2E recovery password without creating key material.
 
-    Returns (password, path, created). ``created`` is always False; Hermes is
-    read-only for Rocket.Chat E2E keys and recovery secrets.
+    Returns (password, path). Hermes is read-only for Rocket.Chat E2E keys and
+    recovery secrets; missing configuration is an error, never a create path.
     """
     password = load_e2e_password(explicit=explicit, env_var=env_var, file_path=file_path)
     if password:
-        return password, file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", ""), False
+        return password, file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", "")
     path_text = file_path or os.getenv("ROCKETCHAT_E2E_PASSWORD_FILE", "") or default_file_path
     raise RuntimeError(f"Rocket.Chat E2E recovery key is not configured; set it first in {path_text}")
 
@@ -139,6 +139,8 @@ def decode_private_key(encrypted_private_key: str, password: str, user_id: str) 
 
 
 def encode_private_key(private_key_json: str, password: str, user_id: str) -> str:
+    # Test/helper-only. Production E2E startup reads the existing Rocket.Chat
+    # identity and never writes or replaces private-key material.
     salt = f"v2:{user_id}:{uuid.uuid4()}"
     iterations = 100000
     key = PBKDF2HMAC(
@@ -170,6 +172,8 @@ def public_key_from_jwk(public_jwk: dict[str, Any]) -> rsa.RSAPublicKey:
 
 
 def generate_rsa_jwks() -> tuple[str, str]:
+    # Test/helper-only. Production Hermes code must not generate Rocket.Chat E2E
+    # identity keys.
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public = key.public_key().public_numbers()
     private = key.private_numbers()
@@ -244,6 +248,8 @@ def encrypt_session_key_for_public(session_key_json: str, kid: str, public_key_j
 
 
 def generate_session_key() -> tuple[str, str, bytes]:
+    # Test/helper-only. Production Hermes code must not create or publish room
+    # session keys.
     key = os.urandom(32)
     kid = str(uuid.uuid4())
     jwk = {

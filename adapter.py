@@ -662,13 +662,11 @@ class RocketChatAdapter(BasePlatformAdapter):
             return
         try:
             self._e2e_module = _load_e2e_module()
-            password, password_path, password_created = self._e2e_module.load_or_create_e2e_password(
+            password, password_path = self._e2e_module.load_required_e2e_password(
                 explicit=self.e2e_password,
                 file_path=self.e2e_password_file,
             )
-            if password_created:
-                logger.info("Rocket.Chat: generated local E2E recovery password file at %s", password_path)
-            elif password_path:
+            if password_path:
                 logger.info("Rocket.Chat: loaded local E2E recovery password file at %s", password_path)
             self._e2e = self._e2e_module.RocketChatE2E(
                 user_id=self.user_id,

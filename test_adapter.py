@@ -824,12 +824,12 @@ def test_e2e_decrypt_message_exposes_decrypted_file_encryption_metadata():
     assert decrypted["files"][0]["encryption"]["type"] == "image/png"
 
 
-def test_e2e_helper_refuses_to_create_password_file_when_absent(tmp_path):
+def test_e2e_helper_requires_existing_password_file_when_absent(tmp_path):
     e2e = adapter._load_e2e_module()
     secret_path = tmp_path / "rocketchat-e2e.env"
 
     try:
-        e2e.load_or_create_e2e_password(file_path=str(secret_path))
+        e2e.load_required_e2e_password(file_path=str(secret_path))
     except RuntimeError as exc:
         assert "recovery key is not configured" in str(exc)
     else:
@@ -1379,6 +1379,48 @@ def test_e2e_command_enables_persistent_mode(monkeypatch):
     assert "ROOM1" in rc._e2e_persistent_rooms
     assert "ROOM1" not in rc._e2e_disable_after_reply
     assert sent and "persistent mode ready" in sent[0][1]
+
+
+def test_backfilled_e2e_command_is_delivered_without_local_side_effects(monkeypatch):
+    rc = _bare_adapter()
+    rc.e2e_enabled = True
+    rc._e2e = object()
+    rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="mark", t="d", encrypted=True)}
+    sent = []
+    events = []
+
+    async def fake_ready(room, *, wait_for_key=True):
+        raise AssertionError("backfilled E2E commands must not arm or change local mode")
+
+    async def fake_plain(chat_id, content):
+        sent.append((chat_id, content))
+        return adapter.SendResult(success=True)
+
+    def fake_build_source(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    monkeypatch.setattr(rc, "_ensure_e2e_exchange_ready", fake_ready)
+    monkeypatch.setattr(rc, "_send_plain_text", fake_plain)
+    monkeypatch.setattr(rc, "build_source", fake_build_source)
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+
+    msg = {
+        "_id": "backfill-e2e-on",
+        "rid": "ROOM1",
+        "msg": "e2e_on",
+        "__hermes_backfill": True,
+        "ts": {"$date": int(time.time() * 1000)},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert sent == []
+    assert rc._e2e_persistent_rooms == set()
+    assert "ROOM1" not in rc._e2e_armed_until
+    assert events and events[0].text == "e2e_on"
 
 
 def test_e2e_status_command_is_handled_locally(monkeypatch):

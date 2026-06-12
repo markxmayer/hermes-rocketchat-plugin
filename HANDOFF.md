@@ -88,7 +88,7 @@ python -m pytest test_adapter.py -q
 Expected result:
 
 ```text
-55 passed
+56 passed
 ```
 
 ## Configuration
