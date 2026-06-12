@@ -68,6 +68,66 @@ def test_ddp_login_result_does_not_deadlock():
     asyncio.run(run())
 
 
+def test_ddp_subscribe_uses_last_seen_room_timestamp():
+    rc = _bare_adapter()
+    rc._last_seen_message_ms["ROOM1"] = 1688434691876
+    ddp = adapter._DDPClient(rc)
+    sent = []
+
+    class FakeWS:
+        async def send(self, payload):
+            sent.append(payload)
+
+    ddp.ws = FakeWS()
+    ddp._connected.set()
+
+    asyncio.run(ddp.subscribe_room("ROOM1"))
+
+    frame = adapter.json.loads(sent[0])
+    assert frame["name"] == "stream-room-messages"
+    assert frame["params"][0] == "ROOM1"
+    assert frame["params"][1]["args"][0]["lastUpdate"]["$date"] == 1688434691876
+
+
+def test_ddp_login_runs_reconnect_backfill_after_resubscribe():
+    class FakeAdapter:
+        auth_token = "tok"
+        base_url = "https://chat.example.com"
+        backfill_on_connect = True
+        backfill_window_seconds = 123
+
+        def __init__(self):
+            self.backfills = []
+
+        async def _backfill_recent_messages(self, *, window_seconds=300):
+            self.backfills.append(window_seconds)
+
+        def _subscription_last_update_ms(self, rid):
+            return 42
+
+    fake_adapter = FakeAdapter()
+    ddp = adapter._DDPClient(fake_adapter)
+    sent = []
+
+    class FakeWS:
+        async def send(self, payload):
+            sent.append(payload)
+
+    ddp.ws = FakeWS()
+    ddp._desired_rooms.add("ROOM1")
+
+    async def run():
+        await ddp._handle_raw('{"msg":"connected","session":"abc"}')
+        login_id = adapter.json.loads(sent[0])["id"]
+        await ddp._handle_raw(adapter.json.dumps({"msg": "result", "id": login_id, "result": {"id": "u"}}))
+
+    asyncio.run(run())
+
+    assert fake_adapter.backfills == [123]
+    sub_frame = adapter.json.loads(sent[1])
+    assert sub_frame["params"][1]["args"][0]["lastUpdate"]["$date"] == 42
+
+
 def _bare_adapter():
     rc = object.__new__(adapter.RocketChatAdapter)
     rc.base_url = "https://chat.example.com"
@@ -76,6 +136,9 @@ def _bare_adapter():
     rc._bot_username = "hermes"
     rc._rooms = {"ROOM1": adapter._RoomInfo(rid="ROOM1", name="general", t="d")}
     rc._dedup = adapter.MessageDeduplicator(max_size=500, ttl_seconds=6 * 60 * 60)
+    rc._last_seen_message_ms = {}
+    rc.backfill_on_connect = True
+    rc.backfill_window_seconds = 300
     rc.ack_reaction = ""
     rc.mark_as_read = False
     rc.require_mention = False
@@ -95,6 +158,15 @@ def _bare_adapter():
     rc.e2e_background_wait_attempts = 48
     rc.e2e_background_wait_delay = 2.5
     return rc
+
+
+class _FakeContent:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    async def iter_chunked(self, size):
+        for chunk in self._chunks:
+            yield chunk
 
 
 def test_extract_inbound_image_prefers_original_file_link(monkeypatch):
@@ -179,15 +251,13 @@ def test_download_inbound_media_accepts_e2e_octet_stream_with_image_magic(monkey
     class FakeResponse:
         status = 200
         headers = {"Content-Type": "application/octet-stream"}
+        content = _FakeContent([png_body])
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
-
-        async def read(self):
-            return png_body
 
     class FakeSession:
         def get(self, url, headers=None, timeout=None):
@@ -226,15 +296,13 @@ def test_download_inbound_media_decrypts_e2e_file_before_sniffing(monkeypatch):
     class FakeResponse:
         status = 200
         headers = {"Content-Type": "application/octet-stream"}
+        content = _FakeContent([encrypted_body])
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
-
-        async def read(self):
-            return encrypted_body
 
     class FakeSession:
         def get(self, url, headers=None, timeout=None):
@@ -444,6 +512,79 @@ def test_backfill_recent_messages_uses_room_history_and_chronological_order(monk
         "/api/v1/groups.history-old", "/api/v1/groups.history-new",
         "/api/v1/im.history-old", "/api/v1/im.history-new",
     ]
+
+
+def test_handle_rc_message_records_last_seen_room_timestamp(monkeypatch):
+    rc = _bare_adapter()
+    events = []
+
+    def fake_build_source(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_handle_message(event):
+        events.append(event)
+
+    async def fake_extract(msg):
+        return [], []
+
+    monkeypatch.setattr(rc, "build_source", fake_build_source)
+    monkeypatch.setattr(rc, "handle_message", fake_handle_message)
+    monkeypatch.setattr(rc, "_extract_inbound_media", fake_extract)
+
+    seen_ts = int(time.time() * 1000)
+    msg = {
+        "_id": "seen1",
+        "rid": "ROOM1",
+        "msg": "hello",
+        "ts": {"$date": seen_ts},
+        "u": {"_id": "human-id", "username": "mark", "name": "Mark"},
+    }
+
+    asyncio.run(rc._handle_rc_message(msg))
+
+    assert len(events) == 1
+    assert rc._last_seen_message_ms["ROOM1"] == seen_ts
+
+
+def test_limited_response_reader_accepts_small_chunked_body():
+    body = asyncio.run(adapter._read_response_body_limited(
+        SimpleNamespace(headers={}, content=_FakeContent([b"ab", b"cd"])),
+        max_bytes=4,
+        label="media",
+    ))
+
+    assert body == b"abcd"
+
+
+def test_limited_response_reader_rejects_oversized_stream_without_content_length():
+    try:
+        asyncio.run(adapter._read_response_body_limited(
+            SimpleNamespace(headers={}, content=_FakeContent([b"abc", b"de"])),
+            max_bytes=4,
+            label="media",
+        ))
+    except RuntimeError as exc:
+        assert "media file too large" in str(exc)
+    else:
+        raise AssertionError("expected oversized stream to fail")
+
+
+def test_limited_response_reader_rejects_oversized_content_length_before_reading():
+    try:
+        asyncio.run(adapter._read_response_body_limited(
+            SimpleNamespace(headers={"Content-Length": "5"}, content=_FakeContent([b"abc"])),
+            max_bytes=4,
+            label="remote media",
+        ))
+    except RuntimeError as exc:
+        assert "remote media file too large: 5 bytes" in str(exc)
+    else:
+        raise AssertionError("expected oversized Content-Length to fail")
+
+
+def test_rocket_path_segment_quotes_path_separators_and_spaces():
+    assert adapter._rocket_path_segment("ROOM 1/child") == "ROOM%201%2Fchild"
+    assert adapter._rocket_path_segment("file 123") == "file%20123"
 
 
 def test_persistent_seen_messages_survive_adapter_restart(tmp_path):

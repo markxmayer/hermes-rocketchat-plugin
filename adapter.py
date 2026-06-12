@@ -66,6 +66,7 @@ _RECONNECT_JITTER = 0.2
 _STALE_MESSAGE_AGE_SEC = 5 * 60
 _MAX_INBOUND_MEDIA_BYTES = int(os.getenv("ROCKETCHAT_MAX_INBOUND_MEDIA_BYTES", str(25 * 1024 * 1024)))
 _IMAGE_MIME_PREFIX = "image/"
+_DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _PERSISTENT_DEDUP_MAX_IDS = 2000
 _IMAGE_MAGIC_MIME_PREFIXES: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -153,6 +154,31 @@ def _room_type(rc_type: str | None) -> str:
     if rc_type in {"p", "g"}:
         return "group"
     return "channel"
+
+
+def _rocket_path_segment(value: Any) -> str:
+    """Quote one Rocket.Chat REST path segment."""
+    return quote(str(value), safe="")
+
+
+async def _read_response_body_limited(resp: Any, *, max_bytes: int, label: str) -> bytes:
+    """Read an aiohttp response body without allowing unbounded memory growth."""
+    size_header = str(resp.headers.get("Content-Length") or "").strip()
+    if size_header:
+        try:
+            if int(size_header) > max_bytes:
+                raise RuntimeError(f"{label} file too large: {size_header} bytes")
+        except ValueError:
+            logger.debug("Rocket.Chat: ignored invalid Content-Length for %s: %r", label, size_header)
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(_DOWNLOAD_CHUNK_SIZE):
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(f"{label} file too large: {total} bytes")
+        chunks.append(bytes(chunk))
+    return b"".join(chunks)
 
 
 def _strip_bot_mention(text: str, bot_username: str) -> str:
@@ -257,6 +283,8 @@ class _DDPClient:
                     raise RuntimeError(f"DDP login failed: {msg.get('error')}")
                 self._connected.set()
                 await self.resubscribe_all()
+                if getattr(self.adapter, "backfill_on_connect", False):
+                    await self.adapter._backfill_recent_messages(window_seconds=self.adapter.backfill_window_seconds)
                 return
             fut = self._pending.pop(msg_id, None)
             if fut and not fut.done():
@@ -293,11 +321,12 @@ class _DDPClient:
             return
         sub_id = self.next_id()
         self._active_rooms.add(rid)
+        last_update_ms = self.adapter._subscription_last_update_ms(rid)
         await self.send_json({
             "msg": "sub",
             "id": sub_id,
             "name": "stream-room-messages",
-            "params": [rid, {"useCollection": False, "args": [{"lastUpdate": {"$date": int(time.time() * 1000)}}]}],
+            "params": [rid, {"useCollection": False, "args": [{"lastUpdate": {"$date": last_update_ms}}]}],
         })
 
     async def resubscribe_all(self) -> None:
@@ -371,7 +400,21 @@ class RocketChatAdapter(BasePlatformAdapter):
         ).expanduser()
         self._persistent_seen_ids: set[str] = set()
         self._persistent_seen_order: list[str] = []
+        self._last_seen_message_ms: dict[str, int] = {}
         self._load_persistent_seen_messages()
+
+    def _subscription_last_update_ms(self, rid: str) -> int:
+        """Return the timestamp used for Rocket.Chat DDP room subscriptions."""
+        return self._last_seen_message_ms.get(str(rid), int(time.time() * 1000))
+
+    def _note_room_message_ts(self, rid: str, ts_value: Any) -> None:
+        ts = _date_to_epoch(ts_value)
+        if ts is None:
+            return
+        ts_ms = int(ts * 1000)
+        current = self._last_seen_message_ms.get(str(rid), 0)
+        if ts_ms > current:
+            self._last_seen_message_ms[str(rid)] = ts_ms
 
     @property
     def name(self) -> str:
@@ -842,7 +885,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             raise FileNotFoundError(str(path_obj))
         upload_name = file_name or path_obj.name
         media_type = content_type or mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
-        url = urljoin(self.base_url + "/", f"api/v1/rooms.media/{quote(str(rid), safe='')}")
+        url = urljoin(self.base_url + "/", f"api/v1/rooms.media/{_rocket_path_segment(rid)}")
         headers = dict(self._headers())
         headers.pop("Content-Type", None)  # aiohttp sets multipart boundary.
         for attempt in range(4):
@@ -880,7 +923,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") or metadata.get("tmid") or reply_to
             if thread_id:
                 payload["tmid"] = str(thread_id)
-            confirm = await self._api_post(f"/api/v1/rooms.mediaConfirm/{quote(str(chat_id), safe='')}/{quote(file_id, safe='')}", payload)
+            confirm = await self._api_post(f"/api/v1/rooms.mediaConfirm/{_rocket_path_segment(chat_id)}/{_rocket_path_segment(file_id)}", payload)
             msg = confirm.get("message") or {}
             msg_id = msg.get("_id") or confirm.get("_id") or file_id
             return SendResult(success=True, message_id=str(msg_id), raw_response=confirm)
@@ -901,15 +944,10 @@ class RocketChatAdapter(BasePlatformAdapter):
             suffix = Path(name).suffix
         headers = {"Accept": "image/*,video/*,audio/*,application/octet-stream,*/*;q=0.8"}
         async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            body = await resp.read()
+            body = await _read_response_body_limited(resp, max_bytes=_MAX_INBOUND_MEDIA_BYTES, label="remote media")
             if resp.status >= 400:
                 snippet = body[:120].decode("utf-8", errors="replace")
                 raise RuntimeError(f"GET remote media failed HTTP {resp.status}: {snippet}")
-            size_header = str(resp.headers.get("Content-Length") or "").strip()
-            if size_header and int(size_header) > _MAX_INBOUND_MEDIA_BYTES:
-                raise RuntimeError(f"remote media file too large: {size_header} bytes")
-            if len(body) > _MAX_INBOUND_MEDIA_BYTES:
-                raise RuntimeError(f"remote media file too large: {len(body)} bytes")
             response_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if not suffix and response_type:
                 suffix = mimetypes.guess_extension(response_type) or ""
@@ -1253,15 +1291,10 @@ class RocketChatAdapter(BasePlatformAdapter):
         headers.pop("Content-Type", None)
         headers["Accept"] = "image/*,*/*;q=0.8"
         async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            body = await resp.read()
+            body = await _read_response_body_limited(resp, max_bytes=_MAX_INBOUND_MEDIA_BYTES, label="media")
             if resp.status >= 400:
                 snippet = body[:120].decode("utf-8", errors="replace")
                 raise RuntimeError(f"GET media failed HTTP {resp.status}: {snippet}")
-            size_header = str(resp.headers.get("Content-Length") or "").strip()
-            if size_header and int(size_header) > _MAX_INBOUND_MEDIA_BYTES:
-                raise RuntimeError(f"media file too large: {size_header} bytes")
-            if len(body) > _MAX_INBOUND_MEDIA_BYTES:
-                raise RuntimeError(f"media file too large: {len(body)} bytes")
             response_type = str(resp.headers.get("Content-Type") or content_type or "").split(";", 1)[0].strip().lower()
             if encryption and self._e2e and hasattr(self._e2e, "decrypt_file_bytes"):
                 body, decrypted_type = self._e2e.decrypt_file_bytes(encryption, body)
@@ -1405,6 +1438,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         rid = str(msg.get("rid") or "")
         if not msg_id or not rid:
             return
+        self._note_room_message_ts(rid, msg.get("ts"))
         if self._dedup.is_duplicate(msg_id) or self._remember_persistent_seen_message(msg_id):
             return
         room = self._rooms.get(rid, _RoomInfo(rid=rid))

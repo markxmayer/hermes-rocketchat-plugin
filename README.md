@@ -31,12 +31,12 @@ rocketchat
 - Message deletion through `/api/v1/chat.delete` for ephemeral cleanup flows.
 - Native outbound media uploads for images, documents, video, and voice/audio.
 - Generated Hermes images delivered as real Rocket.Chat attachments.
-- Remote image/GIF URL handling: download temporarily, size-check, upload natively, then clean up.
+- Remote image/GIF URL handling: download temporarily with streaming size enforcement, upload natively, then clean up.
 - Thread-aware native media uploads.
 - Rocket.Chat native upload flow: `rooms.media/{rid}` plus `rooms.mediaConfirm`.
 - Cleanup of empty markdown artifacts such as `![title]()` after native file extraction.
 - Multiple-image sending via sequential native uploads.
-- Missed-message backfill on reconnect using recent room history endpoints.
+- Missed-message handling on reconnect using DDP last-seen timestamps plus recent room history backfill.
 - Rocket.Chat-friendly text fallbacks for clarify/confirmation prompts where buttons are unavailable.
 - Optional DM-only Rocket.Chat E2EE support: decrypt incoming encrypted DM text and encrypt outgoing DM replies using keys that already exist in Rocket.Chat. Hermes never creates, rotates, requests, shares, accepts/rejects, or replaces E2E keys; if a key is missing, the user must set/share it in Rocket.Chat first.
 - Inbound image attachments in E2EE DMs are decrypted from Rocket.Chat's AES-CTR encrypted file payloads, then accepted only after byte-level PNG/JPEG/GIF/WebP verification before caching them for Hermes vision.
@@ -159,7 +159,7 @@ python -m pytest ~/.hermes/plugins/rocketchat/test_adapter.py -q -o 'addopts='
 Expected current result:
 
 ```text
-41 passed
+55 passed
 ```
 
 ## Live smoke-test checklist

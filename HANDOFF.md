@@ -40,10 +40,10 @@ rocketchat-platform
 Current local commit used for packaging:
 
 ```text
-v0.3.4 local fix (`fix: make Rocket.Chat E2E key handling read-only`)
+v0.3.5 local fix (`fix: harden reconnect replay and media downloads`)
 ```
 
-Plugin version: `0.3.4`
+Plugin version: `0.3.5`
 
 ## Current capabilities
 
@@ -62,12 +62,12 @@ Plugin version: `0.3.4`
 - Delete message via `/api/v1/chat.delete`.
 - Native outbound media upload for images, documents, video, and voice/audio.
 - Generated Hermes images delivered as native Rocket.Chat attachments.
-- Remote image/GIF URL download, size-check, native upload, and temporary-file cleanup.
+- Remote image/GIF URL download with streaming size enforcement, native upload, and temporary-file cleanup.
 - Thread-aware native media upload.
 - Rocket.Chat two-step upload flow: `rooms.media/{rid}` then `rooms.mediaConfirm`.
 - Cleanup of empty markdown artifacts like `![title]()` after native file extraction.
 - Multiple-image sending through sequential native uploads.
-- Recent-message backfill on reconnect through `channels.history`, `groups.history`, and `im.history`.
+- Recent-message recovery on reconnect through DDP last-seen timestamps plus `channels.history`, `groups.history`, and `im.history` backfill.
 - Rocket.Chat-friendly text fallbacks for clarify and slash-confirm flows.
 - Optional DM-only Rocket.Chat E2EE support.
 - Inbound E2EE DM image attachments are decrypted from Rocket.Chat's AES-CTR file payloads using decrypted attachment-level file metadata and then verified with image magic bytes before caching for Hermes vision.
@@ -88,7 +88,7 @@ python -m pytest test_adapter.py -q
 Expected result:
 
 ```text
-47 passed
+55 passed
 ```
 
 ## Configuration
